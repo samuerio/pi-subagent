@@ -417,7 +417,7 @@ function resolveSpec(
 				name: agent.name,
 				source: agent.source,
 				model: item.model ?? agent.model,
-				thinking: item.thinking,
+				thinking: item.thinking ?? agent.thinking,
 				tools: item.tools ?? agent.tools,
 				systemPrompt: agent.systemPrompt,
 			},

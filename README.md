@@ -213,13 +213,15 @@ name: scout
 description: Fast read-only codebase recon
 tools: read, grep, find, ls
 model: claude-haiku-4-5
+thinking: low
 ---
 
 You are a fast scout. Find the relevant code and report concise, cited findings.
 ```
 
-Then: *"use scout to find the auth code"*. Inline `model`/`tools` passed at call time
-override the file's values.
+Then: *"use scout to find the auth code"*. Inline `model`/`tools`/`thinking` passed at call
+time override the file's values. `thinking` is optional; when omitted (both in the file and
+the call), the child inherits the dispatching session's thinking level for fresh runs.
 
 ### Model allowlist (optional, recommended)
 

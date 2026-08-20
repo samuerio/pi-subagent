@@ -13,6 +13,7 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinking?: string;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -60,11 +61,14 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			.map((t: string) => t.trim())
 			.filter(Boolean);
 
+		const thinking =
+			typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() : undefined;
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			thinking: thinking || undefined,
 			systemPrompt: body,
 			source,
 			filePath,
