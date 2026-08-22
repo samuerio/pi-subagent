@@ -1,12 +1,14 @@
 /**
  * Agent discovery and configuration
+ *
+ * Only global (user-level) named agents are supported, configured in
+ * `~/.pi/agent/agents/*.md`. Project-local agents are not loaded; the
+ * subagent tool's available-agent list always matches this single source.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-
-export type AgentScope = "user" | "project" | "both";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export interface AgentConfig {
 	name: string;
@@ -15,16 +17,10 @@ export interface AgentConfig {
 	model?: string;
 	thinking?: string;
 	systemPrompt: string;
-	source: "user" | "project";
 	filePath: string;
 }
 
-export interface AgentDiscoveryResult {
-	agents: AgentConfig[];
-	projectAgentsDir: string | null;
-}
-
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgentsFromDir(dir: string): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -70,7 +66,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			model: frontmatter.model,
 			thinking: thinking || undefined,
 			systemPrompt: body,
-			source,
 			filePath,
 		});
 	}
@@ -78,53 +73,38 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 	return agents;
 }
 
-function isDirectory(p: string): boolean {
-	try {
-		return fs.statSync(p).isDirectory();
-	} catch {
-		return false;
-	}
-}
-
-function findNearestProjectAgentsDir(cwd: string): string | null {
-	let currentDir = cwd;
-	while (true) {
-		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
-		if (isDirectory(candidate)) return candidate;
-
-		const parentDir = path.dirname(currentDir);
-		if (parentDir === currentDir) return null;
-		currentDir = parentDir;
-	}
-}
-
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+/**
+ * Discover global named agents from `~/.pi/agent/agents/*.md`.
+ *
+ * Result is sorted by name for deterministic output so the rendered
+ * available-agents list is stable across sessions regardless of filesystem
+ * readdir order.
+ */
+export function discoverAgents(): AgentConfig[] {
 	const userDir = path.join(getAgentDir(), "agents");
-	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
-
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
-
-	const agentMap = new Map<string, AgentConfig>();
-
-	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	}
-
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	const agents = loadAgentsFromDir(userDir);
+	return agents.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
-	if (agents.length === 0) return { text: "none", remaining: 0 };
-	const listed = agents.slice(0, maxItems);
-	const remaining = agents.length - listed.length;
-	return {
-		text: listed.map((a) => `${a.name} (${a.source}): ${a.description}`).join("; "),
-		remaining,
-	};
+/**
+ * Render the named-agents section injected into the system prompt.
+ *
+ * Deterministic: input is sorted by name, no dynamic values. Returns an empty
+ * string for an empty list so the caller can skip injection entirely.
+ */
+export function renderAgentsSection(agents: AgentConfig[]): string {
+	if (agents.length === 0) return "";
+	const blocks = agents
+		.slice()
+		.sort((a, b) => a.name.localeCompare(b.name))
+		.map((a) => `  <agent>\n    <name>${a.name}</name>\n    <description>${a.description}</description>\n  </agent>`)
+		.join("\n");
+	return [
+		"## Named Subagents",
+		"The `subagent` tool can delegate to named agents, each running in an isolated context. Pass `agent: \"<name>\"` with a `task` to use one.",
+		"",
+		"<available_agents>",
+		blocks,
+		"</available_agents>",
+	].join("\n");
 }

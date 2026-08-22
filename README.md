@@ -204,9 +204,12 @@ TUI. The synchronous answer to "what if it hangs" is `timeoutMs` + `resume`, not
 
 If you *do* want reusable personas, drop markdown files in:
 
-- `~/.pi/agent/agents/*.md` — user-level (always available)
-- `.pi/agents/*.md` — project-level (only with `agentScope: "project"` or `"both"`)
+- `~/.pi/agent/agents/*.md` — global named agents (always available)
 
+The extension automatically injects the available-agent list into the agent's
+system prompt at session start, so the model knows which `agent` names it can
+pass to `subagent` without you hand-writing an `AGENTS.md` entry. Edit agent
+files and `/reload` to refresh the injected list.
 ```markdown
 ---
 name: scout
@@ -297,11 +300,6 @@ Behavior when enabled:
 - If the file is missing, policy is disabled (legacy behavior).
 - `subagent { listModels: true }` returns compact policy JSON as `{ columns, models, default, allowlistEnabled, configPath }`.
 - **Resume is checked too.** `resume` bypasses model *resolution* (the model is fixed by the resumed session, not re-specified), but the policy is still enforced reactively: as soon as the resumed child reports which model it's actually running, the tool checks it against the allowlist and kills the child immediately (`status=policy-blocked`) if it's not allowed — e.g. a session started before the model was removed from `allowed`. There is no way to "fix" a blocked resume in place (the model is fixed by the session); start a fresh run with an allowed model instead.
-
-**Security:** project-local agents are repo-controlled prompts. By default only user-level
-agents load. Enable project agents with `agentScope: "both"` (or `"project"`), and the tool
-will prompt for confirmation before running them interactively
-(`confirmProjectAgents: false` to disable).
 
 ### Refreshing benchmark data
 
