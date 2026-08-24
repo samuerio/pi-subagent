@@ -30,6 +30,20 @@ import { type AgentConfig, discoverAgents, renderAgentsSection } from "./agents.
 
 const MAX_PARALLEL_TASKS = 8;
 const NAMED_AGENTS_MARKER = "<!-- named-subagents -->";
+/**
+ * Base system prompt for inline (no named-agent) subagent runs. Replaces the
+ * verbose default coding-assistant prompt so the child gets a lean, focused
+ * persona. Any caller-supplied `systemPrompt` parameter is appended to this.
+ */
+const INLINE_BASE_SYSTEM_PROMPT = `You are pi, a powerful AI coding agent.
+
+When invoking the Read tool, ALWAYS use absolute paths.
+When reading a file, read the complete file, not specific line ranges.
+If you've already used the Read tool to read an entire file, do NOT invoke Read on that file again.
+
+If AGENTS.md exists, treat it as ground truth for commands, style, structure. If you discover a recurring command that's missing, ask to append it there.
+
+For any coding task that involves thoroughly searching or understanding the codebase, use the finder tool to intelligently locate relevant code, functions, or patterns. This helps in understanding existing implementations, locating dependencies, or finding similar code before making changes.`;
 
 /**
  * Idempotently append the named-agents section to a system prompt. A marker
@@ -432,13 +446,16 @@ function resolveSpec(
 			policy,
 		);
 	}
+	const inlineSystemPrompt = item.systemPrompt?.trim()
+		? INLINE_BASE_SYSTEM_PROMPT + "\n\n" + item.systemPrompt
+		: INLINE_BASE_SYSTEM_PROMPT;
 	return enforceModelPolicy(
 		{
 			name: "inline",
 			model: item.model,
 			thinking: item.thinking,
 			tools: item.tools,
-			systemPrompt: item.systemPrompt ?? "",
+			systemPrompt: inlineSystemPrompt,
 		},
 		policy,
 	);
@@ -815,7 +832,7 @@ async function runSingleAgent(
 			const tmp = await writePromptToTempFile(spec.name, spec.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
+			args.push("--system-prompt", tmpPromptPath);
 		}
 
 		args.push(`Task: ${task}`);
