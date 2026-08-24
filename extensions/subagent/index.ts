@@ -1045,6 +1045,13 @@ export default function (pi: ExtensionAPI) {
 	let renderedAgentsSection: string | undefined;
 
 	pi.on("session_start", async () => {
+		// Only inject the named-agents section when the subagent tool itself is
+		// active. Telling the model it can use a tool that's excluded by
+		// --tools/--exclude-tools would be misleading.
+		if (!pi.getActiveTools().includes("subagent")) {
+			renderedAgentsSection = undefined;
+			return;
+		}
 		try {
 			renderedAgentsSection = renderAgentsSection(discoverAgents());
 		} catch {
