@@ -206,6 +206,7 @@ interface ResolvedSpec {
 	thinking?: string;
 	tools?: string[];
 	systemPrompt: string;
+	noSkills: boolean;
 }
 
 interface ModelAllowlistLevel {
@@ -426,6 +427,7 @@ function resolveSpec(
 		model?: string;
 		thinking?: string;
 		tools?: string[];
+		noSkills?: boolean;
 	},
 	policy: ModelPolicy,
 ): { spec?: ResolvedSpec; error?: string } {
@@ -442,6 +444,7 @@ function resolveSpec(
 				thinking: item.thinking ?? agent.thinking,
 				tools: item.tools ?? agent.tools,
 				systemPrompt: agent.systemPrompt,
+				noSkills: item.noSkills ?? agent.noSkills ?? true,
 			},
 			policy,
 		);
@@ -456,6 +459,7 @@ function resolveSpec(
 			thinking: item.thinking,
 			tools: item.tools,
 			systemPrompt: inlineSystemPrompt,
+			noSkills: item.noSkills ?? true,
 		},
 		policy,
 	);
@@ -484,6 +488,7 @@ interface RunItem {
 	resume?: string;
 	timeoutMs?: number;
 	label?: string;
+	noSkills?: boolean;
 }
 
 type RunOpts = { resume?: string; timeoutMs?: number; label?: string };
@@ -510,7 +515,7 @@ function resolveRunPlan(
 			return { opts, error: "resume requires a continuation `task` (the steering prompt for the resumed session)." };
 		}
 		return {
-			spec: { name: "resume", systemPrompt: "" },
+			spec: { name: "resume", systemPrompt: "", noSkills: false },
 			opts,
 		};
 	}
@@ -794,6 +799,7 @@ async function runSingleAgent(
 	if (!resumePath && spec.model) args.push("--model", spec.model);
 	if (!resumePath && spec.thinking) args.push("--thinking", spec.thinking);
 	if (!resumePath && spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
+	if (!resumePath && spec.noSkills) args.push("--no-skills");
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -1006,6 +1012,7 @@ const DESC = {
 	resume:
 		"Exact session JSONL path from a previous result's `session` field. The task is appended as a steering prompt. Fresh-run options are ignored; the saved session supplies its runtime configuration.",
 	timeoutMs: "Kill the child after this many ms and return partial output (status=timeout). No default.",
+	noSkills: "Pass `--no-skills` to the child (disable skill auto-discovery). Defaults to true; set false to keep skills auto-discovered.",
 } as const;
 
 const TaskItem = Type.Object({
@@ -1019,6 +1026,7 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
 	resume: Type.Optional(Type.String({ description: DESC.resume })),
 	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
+	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
 });
 
 const ChainItem = Type.Object({
@@ -1034,6 +1042,7 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
 	resume: Type.Optional(Type.String({ description: DESC.resume })),
 	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
+	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
 });
 
 const SubagentParams = Type.Object({
@@ -1046,6 +1055,7 @@ const SubagentParams = Type.Object({
 	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
 	resume: Type.Optional(Type.String({ description: DESC.resume })),
 	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
+	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of steps for sequential execution" })),
 	listModels: Type.Optional(

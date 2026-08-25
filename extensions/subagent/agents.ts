@@ -18,6 +18,7 @@ export interface AgentConfig {
 	thinking?: string;
 	systemPrompt: string;
 	filePath: string;
+	noSkills?: boolean;
 }
 
 function loadAgentsFromDir(dir: string): AgentConfig[] {
@@ -59,6 +60,13 @@ function loadAgentsFromDir(dir: string): AgentConfig[] {
 
 		const thinking =
 			typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() : undefined;
+		const noSkillsRaw = frontmatter.noSkills;
+		const noSkills =
+			typeof noSkillsRaw === "boolean"
+				? noSkillsRaw
+				: typeof noSkillsRaw === "string"
+					? noSkillsRaw.trim().toLowerCase() === "true"
+					: undefined;
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
@@ -67,6 +75,7 @@ function loadAgentsFromDir(dir: string): AgentConfig[] {
 			thinking: thinking || undefined,
 			systemPrompt: body,
 			filePath,
+			noSkills,
 		});
 	}
 
