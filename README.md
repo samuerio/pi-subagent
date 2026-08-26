@@ -45,7 +45,7 @@ because this extension is built to answer each one:
 | **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **Sessions are inspectable.** Each child writes a normal pi session JSONL: `read` it to diagnose what happened, then dispatch a fresh subagent with a corrected task. Inspect → correct → rerun, no hidden state. |
 | **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden. |
 | **Context pollution.** People reach for subagents mid-session to "save context," then dump tool output back into the parent anyway. | The model only sees the child's **final output** (capped), not its streaming internals. Full detail lives in the session file and tool `details`, off to the side. |
-| **All-or-nothing on interrupt.** Kill a fan-out and you lose the work that already finished. | **Abort flushes partial results.** On Ctrl+C / `/interrupt`, completed tasks return their full output, in-flight tasks return partial output, and **every task keeps its own session path** — each one inspectable. No work silently discarded, no sessions-dir archaeology. |
+| **All-or-nothing on interrupt.** Kill a runaway child and you lose the work it already finished. | **Abort flushes partial results.** On Ctrl+C / `/interrupt`, the in-flight child is killed but returns whatever it produced so far with `status=aborted`, and its `session=` path stays attached — inspectable, no sessions-dir archaeology. |
 
 The net effect: you get the *one* genuinely useful property of subagents — an **isolated
 context window for a focused sub-task** — without giving up observability or steerability.
@@ -102,18 +102,18 @@ decides to use the tool. Examples:
 Scan this repo in an isolated context and tell me where auth is handled.
 
 Run 3 subagents in parallel: one to map the data models, one the API routes,
-one the background jobs. Summarize each.
+one the background jobs. Summarize each. (Issue three `subagent` calls in the
+same turn; the harness runs them concurrently.)
 
 Sequence: have a subagent find the rate-limiting code, then ask the main
 agent to dispatch another subagent to propose a fix based on what it found.
 ```
 
-### Modes
+### Mode
 
-| Mode | Shape | Use when |
-|------|-------|----------|
-| **Single** | `{ task }` | One focused isolated task. |
-| **Parallel** | `{ tasks: [{ task }, ...] }` | Independent tasks that don't touch the same files. |
+One task per call: `{ task }`. To fan out, issue multiple `subagent` tool calls
+in the same turn — the pi harness executes sibling tool calls concurrently by
+default, so they run in parallel without an explicit `tasks` array.
 
 ### Per-call options (all optional)
 
@@ -135,19 +135,17 @@ prefixed with one terse machine-parsable line carrying only what the *tool* uniq
 <the child's own final output, verbatim, byte-capped>
 ```
 
-`status` is one of `done` / `failed` / `aborted` / `never-started` / `policy-blocked`. The tool does
+`status` is one of `done` / `failed` / `aborted` / `policy-blocked`. The tool does
 **not** wrap or reformat the child's payload — if you want JSON back, tell the child (via
 `task`/`systemPrompt`) to emit JSON. The rich TUI rendering for the human lives in tool
 `details` and never enters the main agent's context.
 
 ### Abort & partial results
 
-On Ctrl+C / `/interrupt`, the tool **no longer discards completed work**. Every task that
-finished returns its full output; in-flight tasks return partial output with
-`status=aborted`; tasks that hadn't launched return `status=never-started`. **Every task
-keeps its own `session=` path**, so nothing requires digging through the sessions dir. The
-aggregate header reports the mix (e.g. `2 done · 1 aborted · 1 never-started`); the
-`session=` field on each result points at the unfinished child's JSONL for inspection.
+On Ctrl+C / `/interrupt`, the tool **does not discard completed work**. An
+in-flight child is killed and returns whatever it produced so far with
+`status=aborted`, and its `session=` path stays attached so the partial trace
+is inspectable. No work silently discarded, no sessions-dir archaeology.
 
 ### Inspecting child sessions
 
@@ -164,7 +162,7 @@ subagent { task: "You looped on the import. The package is `foo`, not `foo-py`. 
 ```
 
 - The `session=` path is for human/agent inspection of a child's full transcript.
-- Works in single and parallel.
+- Works in single mode.
 
 ### Discovering models
 
@@ -300,10 +298,9 @@ models or thinking levels. Benchmark data is advisory; runtime validation uses p
 
 - **Collapsed view:** status, last few items, usage stats (turns, tokens, cost, context).
 - **Expanded view (Ctrl+O):** full task, tool calls, final output as Markdown, per-task usage.
-- Parallel model-visible output is capped at **50 KB per task**; the full result stays in
-  tool `details` and in the child's session file.
-- **Abort:** Ctrl+C / `/interrupt` kills child processes but **flushes partial results** — completed tasks return their output, in-flight tasks return partial output, and every task keeps its session path (see **Abort & partial results**).
-- Parallel mode is limited to 8 tasks, 4 concurrent.
+- Model-visible output is capped at **50 KB**; the full result stays in tool
+  `details` and in the child's session file.
+- **Abort:** Ctrl+C / `/interrupt` kills the child process but **flushes partial results** — the in-flight child returns partial output and keeps its session path (see **Abort & partial results**).
 
 ---
 

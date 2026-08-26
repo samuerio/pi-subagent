@@ -1,14 +1,11 @@
 /**
- * Subagent Tool - Delegate tasks to specialized agents
+ * Subagent Tool - Delegate a task to an isolated child pi process
  *
- * Spawns a separate `pi` process for each subagent invocation,
- * giving it an isolated context window.
+ * Spawns a separate `pi` process with its own context window. The main agent
+ * fans out by issuing multiple `subagent` tool calls in the same turn; the pi
+ * harness runs sibling tool calls concurrently by default.
  *
- * Supports two modes:
- *   - Single: { agent: "name", task: "...", thinking?: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "...", thinking?: "..." }, ...] }
- *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses JSON mode to capture structured output from the child.
  */
 
 import { spawn } from "node:child_process";
@@ -27,7 +24,6 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents, renderAgentsSection } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
 const NAMED_AGENTS_MARKER = "<!-- named-subagents -->";
 /**
  * Base system prompt for inline (no named-agent) subagent runs. Replaces the
@@ -44,6 +40,10 @@ If AGENTS.md exists, treat it as ground truth for commands, style, structure. If
 
 For any coding task that involves thoroughly searching or understanding the codebase, use the finder tool to intelligently locate relevant code, functions, or patterns. This helps in understanding existing implementations, locating dependencies, or finding similar code before making changes.`;
 
+/** Byte cap on the verbatim child output embedded in the model-facing envelope. */
+const OUTPUT_CAP = 50 * 1024;
+const COLLAPSED_ITEM_COUNT = 10;
+
 /**
  * Idempotently append the named-agents section to a system prompt. A marker
  * guards against double-injection across turns. Deterministic: the same
@@ -53,10 +53,6 @@ export function injectNamedAgents(baseSystemPrompt: string, section: string): st
 	if (baseSystemPrompt.includes(NAMED_AGENTS_MARKER)) return baseSystemPrompt;
 	return [baseSystemPrompt, "", NAMED_AGENTS_MARKER, section].join("\n");
 }
-
-const MAX_CONCURRENCY = 4;
-const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -184,7 +180,6 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
-	step?: number;
 	/** Absolute path to the child's persisted session JSONL, for observability/debugging. */
 	sessionFile?: string;
 	/** Child session id from the JSON session header. */
@@ -461,7 +456,7 @@ function resolveSpec(
 	);
 }
 
-function failedSpecResult(name: string, task: string, step: number | undefined, error: string): SingleResult {
+function failedSpecResult(name: string, task: string, error: string): SingleResult {
 	return {
 		agent: name,
 		task,
@@ -469,7 +464,6 @@ function failedSpecResult(name: string, task: string, step: number | undefined, 
 		messages: [],
 		stderr: error,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		step,
 	};
 }
 
@@ -502,40 +496,7 @@ function resolveRunPlan(
 	return { spec, opts, error };
 }
 
-/** Tally per-status counts for the aggregate header. */
-function tallyStatuses(results: SingleResult[]): string {
-	const counts = new Map<string, number>();
-	for (const r of results) counts.set(statusOf(r), (counts.get(statusOf(r)) ?? 0) + 1);
-	const order = ["done", "failed", "policy-blocked", "aborted", "never-started", "running"];
-	return order
-		.filter((s) => counts.has(s))
-		.map((s) => `${counts.get(s)} ${s}`)
-		.join(" \u00b7 ");
-}
-
-function unfinishedNote(results: SingleResult[]): string {
-	const stuck = results.filter((r) => r.stopReason === "aborted");
-	if (stuck.length === 0) return "";
-	return `\n\nNote: ${stuck.length} task(s) did not finish. The session JSONL path is shown in each task's session= field for inspection.`;
-}
-
-function sessionFooter(result: SingleResult): string {
-	return result.sessionFile ? `\n\n\u2014 session: ${result.sessionFile}` : "";
-}
-
-/** Resolve the child's persisted session JSONL (single file in our run dir). Idempotent. */
-function resolveSessionFile(sessionDir: string, result: SingleResult): void {
-	if (result.sessionFile) return;
-	try {
-		const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
-		if (files.length > 0) result.sessionFile = path.join(sessionDir, files[0]);
-	} catch {
-		/* ignore */
-	}
-}
-
 interface SubagentDetails {
-	mode: "single" | "parallel";
 	results: SingleResult[];
 }
 
@@ -551,7 +512,7 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "never-started", "policy-blocked"]);
+const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "policy-blocked"]);
 
 function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || NON_SUCCESS_STOP_REASONS.has(result.stopReason ?? "");
@@ -567,14 +528,11 @@ function resolveReportedModelId(model: string, provider: string | undefined, pol
 
 function statusOf(result: SingleResult): string {
 	switch (result.stopReason) {
-		case "never-started":
-			return "never-started";
 		case "aborted":
 			return "aborted";
 		case "policy-blocked":
 			return "policy-blocked";
 	}
-	if (result.exitCode === -1) return "running";
 	return isFailedResult(result) ? "failed" : "done";
 }
 
@@ -588,7 +546,6 @@ function buildEnvelope(result: SingleResult): string {
 	if (result.label) parts.push(`label=${result.label}`);
 	parts.push(`agent=${result.agent}`);
 	parts.push(`status=${statusOf(result)}`);
-	if (result.step) parts.push(`step=${result.step}`);
 	if (result.model) parts.push(`model=${result.model}`);
 	if (result.thinking) parts.push(`thinking=${result.thinking}`);
 	if (result.usage.turns) parts.push(`turns=${result.usage.turns}`);
@@ -600,27 +557,18 @@ function buildEnvelope(result: SingleResult): string {
 
 /** Envelope header + the child's verbatim (byte-capped) output. */
 function buildTaskBlock(result: SingleResult): string {
-	return `${buildEnvelope(result)}\n${truncateParallelOutput(getResultOutput(result))}`;
+	return `${buildEnvelope(result)}\n${truncateOutput(getResultOutput(result))}`;
 }
 
-function neverStartedResult(
-	name: string,
-	task: string,
-	label: string | undefined,
-	step: number | undefined,
-): SingleResult {
-	return {
-		agent: name,
-		task,
-		label,
-		exitCode: 1,
-		messages: [],
-		stderr: "",
-		stopReason: "never-started",
-		errorMessage: "Did not start: run was aborted before this task launched.",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		step,
-	};
+function truncateOutput(output: string): string {
+	const byteLength = Buffer.byteLength(output, "utf8");
+	if (byteLength <= OUTPUT_CAP) return output;
+
+	let truncated = output.slice(0, OUTPUT_CAP);
+	while (Buffer.byteLength(truncated, "utf8") > OUTPUT_CAP) {
+		truncated = truncated.slice(0, -1);
+	}
+	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -628,17 +576,6 @@ function getResultOutput(result: SingleResult): string {
 		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 	}
 	return getFinalOutput(result.messages) || "(no output)";
-}
-
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
@@ -654,26 +591,6 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		}
 	}
 	return items;
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
 }
 
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
@@ -709,7 +626,6 @@ async function runSingleAgent(
 	spec: ResolvedSpec,
 	task: string,
 	cwd: string | undefined,
-	step: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
@@ -745,7 +661,17 @@ async function runSingleAgent(
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: spec.model,
 		thinking: spec.thinking,
-		step,
+	};
+
+	/** Resolve the child's persisted session JSONL (single file in our run dir). Idempotent. */
+	const resolveSessionFile = () => {
+		if (currentResult.sessionFile) return;
+		try {
+			const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
+			if (files.length > 0) currentResult.sessionFile = path.join(sessionDir, files[0]);
+		} catch {
+			/* ignore */
+		}
 	};
 
 	const emitUpdate = () => {
@@ -812,9 +738,9 @@ async function runSingleAgent(
 				if (event.type === "session" && event.id) {
 					currentResult.sessionId = event.id;
 					// The child writes its JSONL at session start, so the path is
-					// available immediately \u2014 surface it live (for the human) and so it
+					// available immediately — surface it live (for the human) and so it
 					// is already attached if the run is aborted mid-flight.
-					resolveSessionFile(sessionDir, currentResult);
+					resolveSessionFile();
 					emitUpdate();
 				}
 
@@ -883,9 +809,9 @@ async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		// Resolve the persisted session file path (fallback if the start event was missed).
-		resolveSessionFile(sessionDir, currentResult);
+		resolveSessionFile();
 		// Abort no longer throws: return the partial result so completed work
-		// is never discarded and the session path stays inspectable/resumable.
+		// is never discarded and the session path stays inspectable.
 		if (wasPolicyBlocked) currentResult.stopReason = "policy-blocked";
 		else if (wasAborted) currentResult.stopReason = "aborted";
 		return currentResult;
@@ -905,8 +831,8 @@ async function runSingleAgent(
 	}
 }
 
-// Shared param-description fragments: single source of truth, composed per
-// schema below to avoid copy/paste drift across the three item schemas.
+// Shared param-description fragments: single source of truth, composed into the
+// schema below to avoid copy/paste drift.
 const DESC = {
 	task: "Task for the child.",
 	label: "Correlation label echoed in the result envelope (e.g. repo/feature name).",
@@ -921,20 +847,8 @@ const DESC = {
 	noSkills: "Pass `--no-skills` to the child (disable skill auto-discovery). Defaults to true; set false to keep skills auto-discovered.",
 } as const;
 
-const TaskItem = Type.Object({
-	task: Type.String({ description: DESC.task }),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
-	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
-});
-
 const SubagentParams = Type.Object({
-	task: Type.Optional(Type.String({ description: `${DESC.task} (single mode)` })),
+	task: Type.Optional(Type.String({ description: DESC.task })),
 	label: Type.Optional(Type.String({ description: DESC.label })),
 	agent: Type.Optional(Type.String({ description: DESC.agent })),
 	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
@@ -942,11 +856,10 @@ const SubagentParams = Type.Object({
 	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
 	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
 	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
 	listModels: Type.Optional(
 		Type.Boolean({ description: "Show exact allowed model ids, thinking levels, benchmark summaries, default, and validation errors. No subagent is spawned." }),
 	),
-	cwd: Type.Optional(Type.String({ description: `${DESC.cwd} (single mode)` })),
+	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -980,8 +893,8 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate work to an isolated child pi process.",
-			"Use `task` for one run, `tasks` for parallel runs.",
+			"Delegate a task to an isolated child pi process with its own context window.",
+			"To run tasks in parallel, issue multiple `subagent` tool calls in the same turn; the harness executes sibling tool calls concurrently.",
 			"Use `listModels: true` to discover exact allowed model ids and thinking levels.",
 		].join(" "),
 		parameters: SubagentParams,
@@ -990,6 +903,8 @@ export default function (pi: ExtensionAPI) {
 			const agents = discoverAgents();
 			const { policy: modelPolicy, error: modelPolicyError } = loadModelPolicy();
 			const validationErrors = modelPolicyError ? [] : validateModelPolicy(modelPolicy, ctx.modelRegistry);
+
+			const makeDetails = (results: SingleResult[]): SubagentDetails => ({ results });
 
 			if (params.listModels) {
 				const compactModels = compactModelList(modelPolicy);
@@ -1006,189 +921,61 @@ export default function (pi: ExtensionAPI) {
 				};
 				return {
 					content: [{ type: "text", text: JSON.stringify(payload) }],
-					details: {
-						mode: "single" as const,
-						results: [],
-					},
+					details: makeDetails([]),
 				};
 			}
-
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.task);
-			const modeCount = Number(hasTasks) + Number(hasSingle);
-
-			const makeDetails =
-				(mode: "single" | "parallel") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					results,
-				});
 
 			if (modelPolicyError || validationErrors.length > 0) {
 				const errorText = [modelPolicyError, ...validationErrors].filter(Boolean).join("\n");
 				return {
 					content: [{ type: "text", text: errorText }],
-					details: makeDetails("single")([]),
+					details: makeDetails([]),
 					isError: true,
 				};
 			}
 
-			if (modeCount !== 1) {
+			if (!params.task) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+							text: `Invalid parameters. Provide a \`task\`.\nAvailable agents: ${available}`,
 						},
 					],
-					details: makeDetails("single")([]),
+					details: makeDetails([]),
 				};
 			}
 
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent ?? "inline",
-						task: params.tasks[i].task,
-						label: params.tasks[i].label,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					if (signal?.aborted) {
-						const ns = neverStartedResult(t.agent ?? "inline", t.task, t.label, undefined);
-						allResults[index] = ns;
-						emitParallelUpdate();
-						return ns;
-					}
-					const { spec, opts, error } = resolveRunPlan(agents, t, modelPolicy);
-					if (error || !spec) {
-						const failed = failedSpecResult(t.agent ?? "inline", t.task, undefined, error ?? "resolve failed");
-						failed.label = t.label;
-						allResults[index] = failed;
-						emitParallelUpdate();
-						return failed;
-					}
-					const result = await runSingleAgent(
-						ctx.cwd,
-						spec,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-						opts,
-						modelPolicy,
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const blocks = results.map(buildTaskBlock);
-				const header = `subagent parallel \u00b7 ${tallyStatuses(results)} (of ${results.length})`;
+			const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, modelPolicy);
+			if (error || !spec) {
+				const failed = failedSpecResult(params.agent ?? "inline", params.task, error ?? "resolve failed");
+				failed.label = params.label;
 				return {
-					content: [
-						{
-							type: "text",
-							text: `${header}\n\n${blocks.join("\n\n---\n\n")}${unfinishedNote(results)}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-					isError: successCount === 0,
+					content: [{ type: "text", text: error ?? "resolve failed" }],
+					details: makeDetails([failed]),
+					isError: true,
 				};
 			}
-
-			if (params.task) {
-				const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, modelPolicy);
-				if (error || !spec) {
-					const failed = failedSpecResult(params.agent ?? "inline", params.task, undefined, error ?? "resolve failed");
-					failed.label = params.label;
-					return {
-						content: [{ type: "text", text: error ?? "resolve failed" }],
-						details: makeDetails("single")([failed]),
-						isError: true,
-					};
-				}
-				const result = await runSingleAgent(
-					ctx.cwd,
-					spec,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-					opts,
-					modelPolicy,
-				);
-				return {
-					content: [{ type: "text", text: buildTaskBlock(result) }],
-					details: makeDetails("single")([result]),
-					isError: isFailedResult(result),
-				};
-			}
-
-			const available = agents.map((a) => a.name).join(", ") || "none";
+			const result = await runSingleAgent(
+				ctx.cwd,
+				spec,
+				params.task,
+				params.cwd,
+				signal,
+				onUpdate,
+				makeDetails,
+				opts,
+				modelPolicy,
+			);
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
+				content: [{ type: "text", text: buildTaskBlock(result) }],
+				details: makeDetails([result]),
+				isError: isFailedResult(result),
 			};
 		},
 
 		renderCall(args, theme, _context) {
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent ?? "inline")}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
 			const agentName = args.agent || "inline";
 			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
 			let text =
@@ -1223,172 +1010,62 @@ export default function (pi: ExtensionAPI) {
 				return text.trimEnd();
 			};
 
-			if (details.mode === "single" && details.results.length === 1) {
-				const r = details.results[0];
-				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages);
-				const finalOutput = getFinalOutput(r.messages);
+			const r = details.results[0];
+			const isError = isFailedResult(r);
+			const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+			const displayItems = getDisplayItems(r.messages);
+			const finalOutput = getFinalOutput(r.messages);
 
-				if (expanded) {
-					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-					} else {
-						for (const item of displayItems) {
-							if (item.type === "toolCall")
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-						}
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
+			if (expanded) {
+				const container = new Container();
+				let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+				if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				container.addChild(new Text(header, 0, 0));
+				if (isError && r.errorMessage)
+					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+				container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+				if (displayItems.length === 0 && !finalOutput) {
+					container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+				} else {
+					for (const item of displayItems) {
+						if (item.type === "toolCall")
+							container.addChild(
+								new Text(
+									theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+									0, 0,
+								),
+							);
 					}
-					const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-					if (usageStr) {
+					if (finalOutput) {
 						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+						container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 					}
-					if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					return container;
-				}
-
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
 				const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
-				return new Text(text, 0, 0);
+				if (usageStr) {
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+				}
+				if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
+				return container;
 			}
 
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
-
-			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
-				const isRunning = running > 0;
-				const icon = isRunning
-					? theme.fg("warning", "⏳")
-					: failCount > 0
-						? theme.fg("warning", "◐")
-						: theme.fg("success", "✓");
-				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running`
-					: `${successCount}/${details.results.length} tasks`;
-
-				if (expanded && !isRunning) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const taskUsage = formatUsageStats(r.usage, r.model, r.thinking);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
-						if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view (or still running)
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-					if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
-				}
-				if (!isRunning) {
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				}
-				if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
+			let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+			if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+			if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
+			else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+			else {
+				text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+				if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 			}
-
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
+			if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+			if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
+			return new Text(text, 0, 0);
 		},
 	});
 }
