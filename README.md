@@ -5,8 +5,8 @@ process), then hand the result back to the main agent — while keeping the main
 context window clean and **every child fully observable *and* steerable for agents and humans**.
 
 This is a deliberately *thin* primitive. The main agent is the intelligence; this tool
-just gives it a clean way to spawn isolated work, **read the receipts, and steer or resume any child**
- — including after an interrupt or timeout, without losing the work already done.
+just gives it a clean way to spawn isolated work, **read the receipts, and inspect any child's session**
+ — including after an interrupt, without losing the work already done.
 
 ---
 
@@ -42,17 +42,17 @@ because this extension is built to answer each one:
 | The usual complaint | What this extension does |
 |---|---|
 | **"Black box within a black box."** You can't see what the subagent did. | Each child's **full transcript is persisted to a session JSONL**, and the file path is returned in the result — in a terse `[status=… model=… session=…]` envelope so the supervisor sees *which model ran and how it went* without opening anything. You (or the main agent) can open the JSONL and read every step. |
-| **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **`resume` is first-class.** The session file is a normal pi session: `read` it to diagnose, then `subagent { resume, task: <correction> }` to continue the **same** context with a steering prompt — the child keeps everything it learned, plus your fix. Inspect → steer → continue, no lost work. |
-| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden — and on `resume` the correction is just the next turn. |
+| **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **Sessions are inspectable.** Each child writes a normal pi session JSONL: `read` it to diagnose what happened, then dispatch a fresh subagent with a corrected task. Inspect → correct → rerun, no hidden state. |
+| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden. |
 | **Context pollution.** People reach for subagents mid-session to "save context," then dump tool output back into the parent anyway. | The model only sees the child's **final output** (capped), not its streaming internals. Full detail lives in the session file and tool `details`, off to the side. |
-| **All-or-nothing on interrupt.** Kill a fan-out and you lose the work that already finished. | **Abort & timeout flush partial results.** On Ctrl+C / `/interrupt` / `timeoutMs`, completed tasks return their full output, in-flight tasks return partial output, and **every task keeps its own session path** — each one inspectable and `resume`-able. No work silently discarded, no sessions-dir archaeology. |
+| **All-or-nothing on interrupt.** Kill a fan-out and you lose the work that already finished. | **Abort flushes partial results.** On Ctrl+C / `/interrupt`, completed tasks return their full output, in-flight tasks return partial output, and **every task keeps its own session path** — each one inspectable. No work silently discarded, no sessions-dir archaeology. |
 
 The net effect: you get the *one* genuinely useful property of subagents — an **isolated
 context window for a focused sub-task** — without giving up observability or steerability.
 Two features make that real rather than aspirational:
 
-- **`resume`** turns every child into something you can *inspect, correct, and continue* — the steerability a black-box subagent can't offer.
-- **abort/timeout partial-flush** means interrupting is safe: you never trade away finished work to stop a runaway, and the receipts for *un*finished work are right there to resume from.
+- **inspectable sessions** turn every child into something you can *inspect and correct* — the steerability a black-box subagent can't offer. Each child persists a normal pi session JSONL; `read` it to see exactly what happened, then dispatch a fresh subagent with a corrected task.
+- **abort partial-flush** means interrupting is safe: you never trade away finished work to stop a runaway, and the receipts for *un*finished work are right there to inspect.
 
 ### Why no persona files
 
@@ -82,8 +82,8 @@ Two streams, deliberately separated:
   **not** enter the main agent's context.
 - **To the main agent:** only the final output, byte-capped, prefixed with a terse
   `[key=value …]` envelope (status, model, `label`, `session=<path>`, cost) so it can
-  correlate quality↔model and read the full trace if it wants to verify, debug, or
-  `resume`. See [Result envelope](#result-envelope).
+  correlate quality↔model and read the full trace if it wants to verify or debug.
+  See [Result envelope](#result-envelope).
 
 Child sessions are written under:
 
@@ -104,8 +104,8 @@ Scan this repo in an isolated context and tell me where auth is handled.
 Run 3 subagents in parallel: one to map the data models, one the API routes,
 one the background jobs. Summarize each.
 
-Chain: first have a subagent find the rate-limiting code, then have another
-propose a fix based on what it found.
+Sequence: have a subagent find the rate-limiting code, then ask the main
+agent to dispatch another subagent to propose a fix based on what it found.
 ```
 
 ### Modes
@@ -114,7 +114,6 @@ propose a fix based on what it found.
 |------|-------|----------|
 | **Single** | `{ task }` | One focused isolated task. |
 | **Parallel** | `{ tasks: [{ task }, ...] }` | Independent tasks that don't touch the same files. |
-| **Chain** | `{ chain: [{ task }, ...] }` | Sequential steps; `{previous}` in a task is replaced with the prior step's output. |
 
 ### Per-call options (all optional)
 
@@ -125,8 +124,6 @@ propose a fix based on what it found.
 - `cwd` — working directory for the child process.
 - `agent` — name of a `*.md` agent file (optional; see below).
 - `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
-- `resume` — exact JSONL path from a prior result's `session=` field (see **Resume**).
-- `timeoutMs` — kill the child after N ms and return its partial output with `status=timeout` (see **Timeouts**).
 
 ### Result envelope
 
@@ -134,11 +131,11 @@ Subagent output is consumed by the **main agent**, not a human, so each task's r
 prefixed with one terse machine-parsable line carrying only what the *tool* uniquely knows:
 
 ```
-[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex thinking=low timeoutMs=120000 turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
+[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex thinking=low turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
 <the child's own final output, verbatim, byte-capped>
 ```
 
-`status` is one of `done` / `failed` / `timeout` / `aborted` / `never-started` / `policy-blocked`. The tool does
+`status` is one of `done` / `failed` / `aborted` / `never-started` / `policy-blocked`. The tool does
 **not** wrap or reformat the child's payload — if you want JSON back, tell the child (via
 `task`/`systemPrompt`) to emit JSON. The rich TUI rendering for the human lives in tool
 `details` and never enters the main agent's context.
@@ -149,40 +146,25 @@ On Ctrl+C / `/interrupt`, the tool **no longer discards completed work**. Every 
 finished returns its full output; in-flight tasks return partial output with
 `status=aborted`; tasks that hadn't launched return `status=never-started`. **Every task
 keeps its own `session=` path**, so nothing requires digging through the sessions dir. The
-aggregate header reports the mix (e.g. `2 done · 1 aborted · 1 never-started`) and points
-you at `subagent { resume }` for the unfinished ones.
+aggregate header reports the mix (e.g. `2 done · 1 aborted · 1 never-started`); the
+`session=` field on each result points at the unfinished child's JSONL for inspection.
 
-### Resume
+### Inspecting child sessions
 
-Resume continues the **same** session file (appends the next turn via `pi --session`), so the
-child keeps its cache-compatible runtime configuration and prior context:
+Each child persists a normal pi session JSONL at the path shown in its result's `session=`
+field. `read` it to diagnose what happened, then dispatch a fresh subagent with a corrected
+task if needed:
 
 ```
-subagent {
-  resume: "/…/sessions/subagent/<runId>/<id>.jsonl",   // exact session= JSONL path
-  task: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests.",
-  timeoutMs: 120000
-}
+# the result envelope showed: session=/…/sessions/subagent/<runId>/<id>.jsonl
+read /…/sessions/subagent/<runId>/<id>.jsonl
+
+# then rerun with a corrected task:
+subagent { task: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests." }
 ```
 
-- `resume` must be the exact JSONL path shown in a previous result's `session=` field, not a session id, label, run id, or basename.
-- `task` is **required** on a resume (it's the steering prompt) and is appended as the next user turn.
-- Runtime fields (`agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd`) are ignored on resume; the original session owns them for provider prefix-cache compatibility. Only `timeoutMs` and `label` affect the resumed invocation.
-- Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume: <session-jsonl-path>, task: <correction> }`.
-- Works in single, parallel, and chain.
-
-### Timeouts
-
-`timeoutMs` bounds a run: on expiry the child gets `SIGTERM` (then `SIGKILL` after a grace
-period) and returns its **partial output** with `status=timeout` and its session path —
-never an exception, same flush path as abort. There is **no default timeout**; unbounded
-fire-and-await is the default.
-
-> **KV-cache caveat.** Killing a child throws away the provider-side prompt cache (warm KV
-> prefix), which has a short idle TTL (~5 min on most labs). A `resume` after the TTL
-> lapses re-prefills the whole context at full input price. If you time out and intend to
-> continue, **resume promptly** to maximize cache hits. A bare timeout with no resume plan
-> pays for work twice — prefer it only as a genuine hang guard.
+- The `session=` path is for human/agent inspection of a child's full transcript.
+- Works in single and parallel.
 
 ### Discovering models
 
@@ -198,7 +180,7 @@ whether the policy is enabled, and the config path. No subagent is spawned.
 Subagent calls are **synchronous fire-and-await**: the main agent's loop is suspended for
 the entire call, so there is no live channel back to the model mid-run (a "heartbeat" to
 the orchestrator is structurally impossible). The human *does* see live streaming in the
-TUI. The synchronous answer to "what if it hangs" is `timeoutMs` + `resume`, not a heartbeat.
+TUI. The synchronous answer to "what if it hangs" is `abort`, not a heartbeat.
 
 ### Named agents (optional)
 
@@ -295,11 +277,9 @@ Behavior when enabled:
 
 - Effective model resolution is: inline `model` → named-agent `model` → allowlist `default`.
 - The resolved model must match an allowed `id` exactly.
-- **`levels` is enforced, not just descriptive.** If an allowed entry includes a `levels` object, the resolved `thinking` value must be one of its keys or the call fails (fresh runs only — `thinking` can't be passed on `resume` at all). Remove a level key (e.g. remove `"xhigh"`) to block it for that model. Omit the `levels` key on an entry entirely to leave thinking unrestricted for that model.
+- **`levels` is enforced, not just descriptive.** If an allowed entry includes a `levels` object, the resolved `thinking` value must be one of its keys or the call fails. Remove a level key (e.g. remove `"xhigh"`) to block it for that model. Omit the `levels` key on an entry entirely to leave thinking unrestricted for that model.
 - If no model resolves and no `default` is set, the call fails early.
 - If the file is missing, policy is disabled (legacy behavior).
-- `subagent { listModels: true }` returns compact policy JSON as `{ columns, models, default, allowlistEnabled, configPath }`.
-- **Resume is checked too.** `resume` bypasses model *resolution* (the model is fixed by the resumed session, not re-specified), but the policy is still enforced reactively: as soon as the resumed child reports which model it's actually running, the tool checks it against the allowlist and kills the child immediately (`status=policy-blocked`) if it's not allowed — e.g. a session started before the model was removed from `allowed`. There is no way to "fix" a blocked resume in place (the model is fixed by the session); start a fresh run with an allowed model instead.
 
 ### Refreshing benchmark data
 
@@ -337,7 +317,7 @@ When a child's summary looks off, let you or the agent read the receipts:
 ~/.pi/agent/sessions/subagent/1718000000000-ab12cd/2026....jsonl
 
 # inspect it
-pi --session <that-file>      # resume / browse with /tree
+pi --session <that-file>      # browse with /tree
 # or just have the main agent `read` the file
 ```
 

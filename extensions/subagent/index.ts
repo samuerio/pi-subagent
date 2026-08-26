@@ -4,10 +4,9 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
+ * Supports two modes:
  *   - Single: { agent: "name", task: "...", thinking?: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "...", thinking?: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ...", thinking?: "..." }, ...] }
  *
  * Uses JSON mode to capture structured output from subagents.
  */
@@ -177,10 +176,7 @@ interface SingleResult {
 	task: string;
 	/** Optional caller-supplied correlation label, echoed in the model-facing envelope. */
 	label?: string;
-	/** True when this item was a resume of an existing session rather than a fresh run. */
-	resumed?: boolean;
 	thinking?: string;
-	timeoutMs?: number;
 	exitCode: number;
 	messages: Message[];
 	stderr: string;
@@ -485,18 +481,14 @@ interface RunItem {
 	thinking?: string;
 	tools?: string[];
 	cwd?: string;
-	resume?: string;
-	timeoutMs?: number;
 	label?: string;
 	noSkills?: boolean;
 }
 
-type RunOpts = { resume?: string; timeoutMs?: number; label?: string };
+type RunOpts = { label?: string };
 
 /**
- * Resolve an item into a runnable spec + per-run opts. Resume bypasses spec
- * resolution. Runtime-affecting params stay fixed by the original session for
- * provider prefix-cache compatibility.
+ * Resolve an item into a runnable spec + per-run opts.
  */
 function resolveRunPlan(
 	agents: AgentConfig[],
@@ -504,21 +496,8 @@ function resolveRunPlan(
 	policy: ModelPolicy,
 ): { spec?: ResolvedSpec; opts: RunOpts; error?: string } {
 	const opts: RunOpts = {
-		resume: item.resume?.trim() || undefined,
-		timeoutMs: item.timeoutMs,
 		label: item.label,
 	};
-	if (opts.resume) {
-		// Resume owns all runtime configuration. Ignore any wrapper-injected fresh-run
-		// fields rather than rejecting an otherwise valid continuation request.
-		if (!item.task || !item.task.trim()) {
-			return { opts, error: "resume requires a continuation `task` (the steering prompt for the resumed session)." };
-		}
-		return {
-			spec: { name: "resume", systemPrompt: "", noSkills: false },
-			opts,
-		};
-	}
 	const { spec, error } = resolveSpec(agents, item, policy);
 	return { spec, opts, error };
 }
@@ -527,7 +506,7 @@ function resolveRunPlan(
 function tallyStatuses(results: SingleResult[]): string {
 	const counts = new Map<string, number>();
 	for (const r of results) counts.set(statusOf(r), (counts.get(statusOf(r)) ?? 0) + 1);
-	const order = ["done", "failed", "policy-blocked", "timeout", "aborted", "never-started", "running"];
+	const order = ["done", "failed", "policy-blocked", "aborted", "never-started", "running"];
 	return order
 		.filter((s) => counts.has(s))
 		.map((s) => `${counts.get(s)} ${s}`)
@@ -535,9 +514,9 @@ function tallyStatuses(results: SingleResult[]): string {
 }
 
 function unfinishedNote(results: SingleResult[]): string {
-	const stuck = results.filter((r) => r.stopReason === "aborted" || r.stopReason === "timeout");
+	const stuck = results.filter((r) => r.stopReason === "aborted");
 	if (stuck.length === 0) return "";
-	return `\n\nNote: ${stuck.length} task(s) did not finish. Resume with the exact JSONL path shown in that task's session= field: subagent { resume: <session-jsonl-path>, task: <steer> }.`;
+	return `\n\nNote: ${stuck.length} task(s) did not finish. The session JSONL path is shown in each task's session= field for inspection.`;
 }
 
 function sessionFooter(result: SingleResult): string {
@@ -555,34 +534,8 @@ function resolveSessionFile(sessionDir: string, result: SingleResult): void {
 	}
 }
 
-function expandHome(inputPath: string): string {
-	if (inputPath === "~") return os.homedir();
-	if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-		return path.join(os.homedir(), inputPath.slice(2));
-	}
-	return inputPath;
-}
-
-function resolveResumeSessionPath(inputPath: string): { path?: string; error?: string } {
-	const expanded = expandHome(inputPath.trim());
-	if (!path.isAbsolute(expanded)) {
-		return { error: "resume must be the exact child session JSONL path from a previous result's `session=` field." };
-	}
-	const resolved = path.resolve(expanded);
-	if (path.extname(resolved) !== ".jsonl") {
-		return { error: "resume must be the exact child session JSONL path from a previous result's `session=` field." };
-	}
-	try {
-		const stat = fs.statSync(resolved);
-		if (!stat.isFile()) return { error: `resume path is not a file: ${resolved}` };
-	} catch {
-		return { error: `resume session file not found: ${resolved}` };
-	}
-	return { path: resolved };
-}
-
 interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: "single" | "parallel";
 	results: SingleResult[];
 }
 
@@ -598,7 +551,7 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "timeout", "never-started", "policy-blocked"]);
+const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "never-started", "policy-blocked"]);
 
 function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || NON_SUCCESS_STOP_REASONS.has(result.stopReason ?? "");
@@ -618,8 +571,6 @@ function statusOf(result: SingleResult): string {
 			return "never-started";
 		case "aborted":
 			return "aborted";
-		case "timeout":
-			return "timeout";
 		case "policy-blocked":
 			return "policy-blocked";
 	}
@@ -636,12 +587,10 @@ function buildEnvelope(result: SingleResult): string {
 	const parts: string[] = [];
 	if (result.label) parts.push(`label=${result.label}`);
 	parts.push(`agent=${result.agent}`);
-	if (result.resumed) parts.push("resumed=true");
 	parts.push(`status=${statusOf(result)}`);
 	if (result.step) parts.push(`step=${result.step}`);
 	if (result.model) parts.push(`model=${result.model}`);
 	if (result.thinking) parts.push(`thinking=${result.thinking}`);
-	if (result.timeoutMs) parts.push(`timeoutMs=${result.timeoutMs}`);
 	if (result.usage.turns) parts.push(`turns=${result.usage.turns}`);
 	if (result.usage.cost) parts.push(`cost=${result.usage.cost.toFixed(4)}`);
 	parts.push(`exit=${result.stopReason ?? "end"}`);
@@ -764,42 +713,24 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	opts?: { resume?: string; timeoutMs?: number; label?: string },
+	opts?: { label?: string },
 	policy?: ModelPolicy,
 ): Promise<SingleResult> {
-	const resumeInput = opts?.resume?.trim() || undefined;
-	const resumeResolution: { path?: string; error?: string } = resumeInput
-		? resolveResumeSessionPath(resumeInput)
-		: {};
-	if (resumeResolution.error) {
-		const failed = failedSpecResult(spec.name, task, step, resumeResolution.error);
-		failed.label = opts?.label;
-		failed.resumed = Boolean(resumeInput);
-		failed.timeoutMs = opts?.timeoutMs;
-		return failed;
-	}
-	const resumePath = resumeResolution.path;
 	// Persist the child's session so the main agent can read the full transcript
 	// for debugging. This is the observability bridge: a path, not a framework.
 	const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 	const sessionDir = path.join(getAgentDir(), "sessions", "subagent", runId);
-	if (!resumePath) {
-		try {
-			await fs.promises.mkdir(sessionDir, { recursive: true });
-		} catch {
-			/* best effort; pi will fall back to its default session dir */
-		}
+	try {
+		await fs.promises.mkdir(sessionDir, { recursive: true });
+	} catch {
+		/* best effort; pi will fall back to its default session dir */
 	}
 
-	// Resume continues the exact session file via --session. Runtime-affecting
-	// options are not passed on resume; the session owns that state.
-	const args: string[] = ["--mode", "json", "-p"];
-	if (resumePath) args.push("--session", resumePath);
-	else args.push("--session-dir", sessionDir);
-	if (!resumePath && spec.model) args.push("--model", spec.model);
-	if (!resumePath && spec.thinking) args.push("--thinking", spec.thinking);
-	if (!resumePath && spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
-	if (!resumePath && spec.noSkills) args.push("--no-skills");
+	const args: string[] = ["--mode", "json", "-p", "--session-dir", sessionDir];
+	if (spec.model) args.push("--model", spec.model);
+	if (spec.thinking) args.push("--thinking", spec.thinking);
+	if (spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
+	if (spec.noSkills) args.push("--no-skills");
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -808,21 +739,14 @@ async function runSingleAgent(
 		agent: spec.name,
 		task,
 		label: opts?.label,
-		resumed: Boolean(resumePath),
 		exitCode: 0,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: resumePath ? undefined : spec.model,
-		thinking: resumePath ? undefined : spec.thinking,
-		timeoutMs: opts?.timeoutMs,
+		model: spec.model,
+		thinking: spec.thinking,
 		step,
 	};
-	// For a resume we already know which session is being continued; surface it
-	// immediately so it is attached even if the resume is aborted early.
-	if (resumePath) {
-		currentResult.sessionFile = resumePath;
-	}
 
 	const emitUpdate = () => {
 		if (onUpdate) {
@@ -834,7 +758,7 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (!resumePath && spec.systemPrompt.trim()) {
+		if (spec.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(spec.name, spec.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
@@ -843,7 +767,6 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
-		let wasTimeout = false;
 		let wasPolicyBlocked = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -854,22 +777,17 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let buffer = "";
-			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 
-			const killProc = (timeout: boolean) => {
-				if (timeout) wasTimeout = true;
-				else wasAborted = true;
+			const killProc = () => {
+				wasAborted = true;
 				proc.kill("SIGTERM");
 				setTimeout(() => {
 					if (!proc.killed) proc.kill("SIGKILL");
 				}, 5000);
 			};
 
-			// Enforced on every run (not just resume) as defense-in-depth, but this is
-			// the actual hole-closer: resume bypasses resolveSpec/enforceModelPolicy
-			// entirely (the model is fixed by the resumed session), so the allowlist
-			// can only be checked reactively, once the child reports which model it's
-			// actually using.
+			// Defense-in-depth: enforce the allowlist reactively once the child
+			// reports which model it's actually using.
 			const blockForPolicy = (model: string) => {
 				if (wasPolicyBlocked) return;
 				wasPolicyBlocked = true;
@@ -896,7 +814,7 @@ async function runSingleAgent(
 					// The child writes its JSONL at session start, so the path is
 					// available immediately \u2014 surface it live (for the human) and so it
 					// is already attached if the run is aborted mid-flight.
-					if (!resumePath) resolveSessionFile(sessionDir, currentResult);
+					resolveSessionFile(sessionDir, currentResult);
 					emitUpdate();
 				}
 
@@ -948,22 +866,16 @@ async function runSingleAgent(
 			});
 
 			proc.on("close", (code) => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
 				if (buffer.trim()) processLine(buffer);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
 				resolve(1);
 			});
 
-			if (opts?.timeoutMs && opts.timeoutMs > 0) {
-				timeoutTimer = setTimeout(() => killProc(true), opts.timeoutMs);
-			}
-
 			if (signal) {
-				const onAbort = () => killProc(false);
+				const onAbort = () => killProc();
 				if (signal.aborted) onAbort();
 				else signal.addEventListener("abort", onAbort, { once: true });
 			}
@@ -971,11 +883,10 @@ async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		// Resolve the persisted session file path (fallback if the start event was missed).
-		if (!resumePath) resolveSessionFile(sessionDir, currentResult);
-		// Abort/timeout no longer throw: return the partial result so completed work
+		resolveSessionFile(sessionDir, currentResult);
+		// Abort no longer throws: return the partial result so completed work
 		// is never discarded and the session path stays inspectable/resumable.
 		if (wasPolicyBlocked) currentResult.stopReason = "policy-blocked";
-		else if (wasTimeout) currentResult.stopReason = "timeout";
 		else if (wasAborted) currentResult.stopReason = "aborted";
 		return currentResult;
 	} finally {
@@ -995,11 +906,9 @@ async function runSingleAgent(
 }
 
 // Shared param-description fragments: single source of truth, composed per
-// schema below. Avoids the copy/paste drift that let a stale field name
-// (`stopReason=timeout`, which is never actually in the model-facing envelope
-// — the envelope key is `status=`) survive identically in three places.
+// schema below to avoid copy/paste drift across the three item schemas.
 const DESC = {
-	task: "Task for the child. With `resume`, this becomes the steering prompt for the saved session.",
+	task: "Task for the child.",
 	label: "Correlation label echoed in the result envelope (e.g. repo/feature name).",
 	agent: "Optional named agent. If omitted, runs inline.",
 	systemPrompt:
@@ -1009,9 +918,6 @@ const DESC = {
 	thinking: "Thinking level for a fresh run. Must be permitted for the selected model when the allowlist is enabled.",
 	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
 	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
-	resume:
-		"Exact session JSONL path from a previous result's `session` field. The task is appended as a steering prompt. Fresh-run options are ignored; the saved session supplies its runtime configuration.",
-	timeoutMs: "Kill the child after this many ms and return partial output (status=timeout). No default.",
 	noSkills: "Pass `--no-skills` to the child (disable skill auto-discovery). Defaults to true; set false to keep skills auto-discovered.",
 } as const;
 
@@ -1024,24 +930,6 @@ const TaskItem = Type.Object({
 	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
 	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
 	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
-	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
-});
-
-const ChainItem = Type.Object({
-	task: Type.String({
-		description: `Task with optional {previous} placeholder for prior output. ${DESC.task}`,
-	}),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
 	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
 });
 
@@ -1053,11 +941,8 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(Type.String({ description: DESC.model })),
 	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
 	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
 	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of steps for sequential execution" })),
 	listModels: Type.Optional(
 		Type.Boolean({ description: "Show exact allowed model ids, thinking levels, benchmark summaries, default, and validation errors. No subagent is spawned." }),
 	),
@@ -1096,8 +981,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to an isolated child pi process.",
-			"Use `task` for one run, `tasks` for parallel runs, or `chain` for sequential runs.",
-			"Use `resume` with a previous session path to continue existing work.",
+			"Use `task` for one run, `tasks` for parallel runs.",
 			"Use `listModels: true` to discover exact allowed model ids and thinking levels.",
 		].join(" "),
 		parameters: SubagentParams,
@@ -1129,13 +1013,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+			const modeCount = Number(hasTasks) + Number(hasSingle);
 
 			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
+				(mode: "single" | "parallel") =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
 					results,
@@ -1163,77 +1046,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					if (signal?.aborted) {
-						results.push(neverStartedResult(step.agent ?? "inline", taskWithContext, step.label, i + 1));
-						break;
-					}
-
-					const { spec, opts, error } = resolveRunPlan(agents, { ...step, task: taskWithContext }, modelPolicy);
-					if (error || !spec) {
-						results.push(failedSpecResult(step.resume ? "resume" : (step.agent ?? "inline"), taskWithContext, i + 1, error ?? "resolve failed"));
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1}: ${error ?? "resolve failed"}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						spec,
-						taskWithContext,
-						opts.resume ? undefined : step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-						opts,
-						modelPolicy,
-					);
-					results.push(result);
-
-					if (isFailedResult(result)) {
-						// Flush every completed step's block, not just the failing one.
-						const blocks = results.map(buildTaskBlock).join("\n\n---\n\n");
-						const header = `chain stopped at step ${i + 1} (${statusOf(result)}) \u00b7 ${tallyStatuses(results)}`;
-						return {
-							content: [{ type: "text", text: `${header}\n\n${blocks}${unfinishedNote(results)}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				const last = results[results.length - 1];
-				return {
-					content: [{ type: "text", text: buildTaskBlock(last) }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
 			if (params.tasks && params.tasks.length > 0) {
 				if (params.tasks.length > MAX_PARALLEL_TASKS)
 					return {
@@ -1252,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
 				// Initialize placeholder results
 				for (let i = 0; i < params.tasks.length; i++) {
 					allResults[i] = {
-						agent: params.tasks[i].resume ? "resume" : (params.tasks[i].agent ?? "inline"),
+						agent: params.tasks[i].agent ?? "inline",
 						task: params.tasks[i].task,
 						label: params.tasks[i].label,
 						exitCode: -1, // -1 = still running
@@ -1277,14 +1089,14 @@ export default function (pi: ExtensionAPI) {
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
 					if (signal?.aborted) {
-						const ns = neverStartedResult(t.resume ? "resume" : (t.agent ?? "inline"), t.task, t.label, undefined);
+						const ns = neverStartedResult(t.agent ?? "inline", t.task, t.label, undefined);
 						allResults[index] = ns;
 						emitParallelUpdate();
 						return ns;
 					}
 					const { spec, opts, error } = resolveRunPlan(agents, t, modelPolicy);
 					if (error || !spec) {
-						const failed = failedSpecResult(t.resume ? "resume" : (t.agent ?? "inline"), t.task, undefined, error ?? "resolve failed");
+						const failed = failedSpecResult(t.agent ?? "inline", t.task, undefined, error ?? "resolve failed");
 						failed.label = t.label;
 						allResults[index] = failed;
 						emitParallelUpdate();
@@ -1294,7 +1106,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						spec,
 						t.task,
-						opts.resume ? undefined : t.cwd,
+						t.cwd,
 						undefined,
 						signal,
 						// Per-task update callback
@@ -1331,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.task) {
 				const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, modelPolicy);
 				if (error || !spec) {
-					const failed = failedSpecResult(params.resume ? "resume" : (params.agent ?? "inline"), params.task, undefined, error ?? "resolve failed");
+					const failed = failedSpecResult(params.agent ?? "inline", params.task, undefined, error ?? "resolve failed");
 					failed.label = params.label;
 					return {
 						content: [{ type: "text", text: error ?? "resolve failed" }],
@@ -1343,7 +1155,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd,
 					spec,
 					params.task,
-					params.resume ? undefined : params.cwd,
+					params.cwd,
 					undefined,
 					signal,
 					onUpdate,
@@ -1366,25 +1178,6 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent ?? "inline") +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
@@ -1502,90 +1295,6 @@ export default function (pi: ExtensionAPI) {
 				}
 				return total;
 			};
-
-			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-
-				if (expanded) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
-								0,
-								0,
-							),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const stepUsage = formatUsageStats(r.usage, r.model, r.thinking);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
-						if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view
-				let text =
-					icon +
-					" " +
-					theme.fg("toolTitle", theme.bold("chain ")) +
-					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-					if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
-				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
 
 			if (details.mode === "parallel") {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
