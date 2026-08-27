@@ -1,7 +1,7 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
   "version": "1.2.0",
-  "description": "Observable, isolated-context subagent for pi — delegate a task to a child pi process, flush partial results on interrupt, lean machine-facing envelope, optional model allowlist. Fan out by issuing multiple subagent calls in the same turn.",
+  "description": "Observable, isolated-context subagent for pi — delegate a task to a child pi process, flush partial results on interrupt, lean machine-facing envelope. Fan out by issuing multiple subagent calls in the same turn.",
   "keywords": [
     "pi-package",
     "pi",

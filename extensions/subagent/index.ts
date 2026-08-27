@@ -28,7 +28,8 @@ const NAMED_AGENTS_MARKER = "<!-- named-subagents -->";
 /**
  * Base system prompt for inline (no named-agent) subagent runs. Replaces the
  * verbose default coding-assistant prompt so the child gets a lean, focused
- * persona. Any caller-supplied `systemPrompt` parameter is appended to this.
+ * persona. Inline runs use this as the full system prompt; the caller's
+ * instructions go into the `task`.
  */
 const INLINE_BASE_SYSTEM_PROMPT = `You are pi, a powerful AI coding agent.
 
@@ -188,8 +189,8 @@ interface SingleResult {
 
 /**
  * A fully-resolved run spec. Either derived from a named agent file or
- * constructed inline from tool params. The main agent is the intelligence:
- * it can author a systemPrompt on the fly without a human-written .md file.
+ * constructed inline from `subagent.json`. The main agent is the intelligence:
+ * it can frame the sub-task inside the `task` without a human-written .md file.
  */
 interface ResolvedSpec {
 	name: string;
@@ -200,227 +201,60 @@ interface ResolvedSpec {
 	noSkills: boolean;
 }
 
-interface ModelAllowlistLevel {
-	artificialAnalysis?: { intelligence?: number; coding?: number; cost?: number };
-	deepSWE?: { pass?: number; cost?: number };
+/**
+ * Default configuration for inline (no named-agent) subagent runs, read from
+ * `~/.pi/agent/subagent.json`. All fields optional; omitted fields fall back
+ * to the child pi process's own defaults. Named agents carry their own
+ * config in their `*.md` frontmatter and are not affected by this file.
+ */
+interface InlineConfig {
+	model?: string;
+	thinking?: string;
+	tools?: string[];
+	noSkills?: boolean;
 }
 
-interface ModelAllowlistEntry {
-	id: string;
-	levels?: Record<string, ModelAllowlistLevel>;
-	[key: string]: unknown;
-}
-
-interface ModelAllowlistConfig {
-	enabled?: boolean;
-	allowed?: (string | ModelAllowlistEntry)[];
-	default?: string;
-}
-
-interface ModelPolicy {
-	enabled: boolean;
-	allowed: Set<string>;
-	/** Raw metadata objects keyed by model id, for models defined as objects in the allowlist. */
-	metadata: Map<string, ModelAllowlistEntry>;
-	defaultModel?: string;
-	configPath: string;
-}
-
-function getModelAllowlistPath(): string {
-	return path.join(import.meta.dirname, "models-allowlist.json");
-}
-
-function loadModelPolicy(): { policy: ModelPolicy; error?: string } {
-	const configPath = getModelAllowlistPath();
-	const basePolicy: ModelPolicy = {
-		enabled: false,
-		allowed: new Set<string>(),
-		metadata: new Map<string, ModelAllowlistEntry>(),
-		defaultModel: undefined,
-		configPath,
-	};
-
-	if (!fs.existsSync(configPath)) return { policy: basePolicy };
+/**
+ * Load inline defaults from `~/.pi/agent/subagent.json`. Returns an empty
+ * config (all defaults) when the file is missing or unreadable. JSON parse
+ * errors are returned so the caller can surface them to the model.
+ */
+function loadInlineConfig(): { config: InlineConfig; error?: string } {
+	const configPath = path.join(getAgentDir(), "subagent.json");
+	if (!fs.existsSync(configPath)) return { config: {} };
 
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 	} catch (error) {
 		return {
-			policy: basePolicy,
-			error: `Invalid JSON in model allowlist: ${configPath} (${error instanceof Error ? error.message : String(error)})`,
+			config: {},
+			error: `Invalid JSON in inline config: ${configPath} (${error instanceof Error ? error.message : String(error)})`,
 		};
 	}
 
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { policy: basePolicy, error: `Model allowlist must be a JSON object: ${configPath}` };
+		return { config: {}, error: `Inline config must be a JSON object: ${configPath}` };
 	}
 
-	const config = parsed as ModelAllowlistConfig;
-	if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
-		return { policy: basePolicy, error: `"enabled" must be boolean in ${configPath}` };
+	const raw = parsed as Record<string, unknown>;
+	const config: InlineConfig = {};
+
+	if (typeof raw.model === "string" && raw.model.trim()) config.model = raw.model.trim();
+	if (typeof raw.thinking === "string" && raw.thinking.trim()) config.thinking = raw.thinking.trim();
+	if (Array.isArray(raw.tools)) {
+		const tools = raw.tools.filter((t): t is string => typeof t === "string" && t.trim().length > 0).map((t) => t.trim());
+		if (tools.length > 0) config.tools = tools;
 	}
-	if (config.allowed !== undefined && !Array.isArray(config.allowed)) {
-		return { policy: basePolicy, error: `"allowed" must be an array of model strings or objects in ${configPath}` };
-	}
-	if (config.default !== undefined && typeof config.default !== "string") {
-		return { policy: basePolicy, error: `"default" must be a model string in ${configPath}` };
-	}
+	if (typeof raw.noSkills === "boolean") config.noSkills = raw.noSkills;
 
-	const metadata = new Map<string, ModelAllowlistEntry>();
-	const allowed = new Set(
-		(config.allowed ?? []).flatMap((entry) => {
-			if (typeof entry === "string") {
-				const id = entry.trim();
-				return id ? [id] : [];
-			}
-			if (entry && typeof entry === "object" && typeof entry.id === "string") {
-				const id = entry.id.trim();
-				if (id) {
-					metadata.set(id, entry);
-					return [id];
-				}
-			}
-			return [];
-		}),
-	);
-	const enabled = config.enabled ?? true;
-	const defaultModel = config.default?.trim() || undefined;
-
-	if (enabled && allowed.size === 0) {
-		return { policy: basePolicy, error: `Model allowlist is enabled but "allowed" is empty in ${configPath}` };
-	}
-	if (enabled && defaultModel && !allowed.has(defaultModel)) {
-		return {
-			policy: basePolicy,
-			error: `"default" model must be present in "allowed" in ${configPath}`,
-		};
-	}
-
-	return {
-		policy: {
-			enabled,
-			allowed,
-			metadata,
-			defaultModel,
-			configPath,
-		},
-	};
-}
-
-function compactModelList(policy: ModelPolicy): { columns: string[]; models: unknown[][] } {
-	const columns = ["id", "levels", "description"];
-	const entries = Array.from(policy.allowed).map((id) => policy.metadata.get(id) ?? { id });
-	const formatLevels = (levels: unknown): string => {
-		if (!levels || typeof levels !== "object" || Array.isArray(levels)) return "";
-		return Object.entries(levels as Record<string, ModelAllowlistLevel>)
-			.map(([level, value]) => {
-				const parts: string[] = [];
-				const aa = value?.artificialAnalysis;
-				if (aa) {
-					const quality = [aa.intelligence, aa.coding]
-						.filter((metric): metric is number => typeof metric === "number")
-						.map((metric) => metric.toFixed(1))
-						.join("/");
-					parts.push(`AA ${quality || "?"}${typeof aa.cost === "number" ? `/$${aa.cost}` : ""}`);
-				}
-				const deepSWE = value?.deepSWE;
-				if (deepSWE) {
-					const pass = typeof deepSWE.pass === "number" ? `${Math.round(deepSWE.pass * 100)}%` : "?";
-					parts.push(`DeepSWE ${pass}${typeof deepSWE.cost === "number" ? `/$${deepSWE.cost}` : ""}`);
-				}
-				return `${level}: ${parts.join(" · ") || "unbenchmarked"}`;
-			})
-			.join(" · ");
-	};
-
-	return {
-		columns,
-		models: entries.map((entry) => [entry.id, formatLevels(entry.levels), entry.description ?? null]),
-	};
-}
-
-/**
- * The keys under `levels` are the per-model thinking levels permitted by policy.
- */
-function getAllowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[] | undefined {
-	const levels = entry?.levels;
-	if (!levels || typeof levels !== "object" || Array.isArray(levels)) return undefined;
-	const names = Object.keys(levels);
-	return names.length > 0 ? names : undefined;
-}
-
-function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] }): string[] {
-	if (!policy.enabled) return [];
-	const errors: string[] = [];
-	const models = new Map<string, any>();
-	for (const model of registry.getAll()) models.set(`${model.provider}/${model.id}`, model);
-
-	for (const id of policy.allowed) {
-		const entry = policy.metadata.get(id);
-		const model = models.get(id);
-		if (!model) {
-			errors.push(`Allowlisted model "${id}" is not known to pi.`);
-			continue;
-		}
-		for (const level of getAllowedThinkingLevels(entry) ?? []) {
-			if (level === "off") continue;
-			if (!model.reasoning) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
-				continue;
-			}
-			const map = model.thinkingLevelMap as Record<string, unknown> | undefined;
-			if ((level === "xhigh" || level === "max") && (!map || !(level in map) || map[level] === null)) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
-			} else if (map && level in map && map[level] === null) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
-			}
-		}
-	}
-	if (policy.defaultModel && !policy.allowed.has(policy.defaultModel)) {
-		errors.push(`Default model "${policy.defaultModel}" is not in the allowlist.`);
-	}
-	return errors;
-}
-
-function enforceModelPolicy(spec: ResolvedSpec, policy: ModelPolicy): { spec?: ResolvedSpec; error?: string } {
-	if (!policy.enabled) return { spec };
-
-	const model = spec.model?.trim() || policy.defaultModel;
-	if (!model) {
-		return {
-			error: `Model is required by allowlist policy. Provide \"model\" or set \"default\" in ${policy.configPath}.`,
-		};
-	}
-	if (!policy.allowed.has(model)) {
-		const allowedPreview = Array.from(policy.allowed).slice(0, 8).join(", ") || "(none)";
-		const extra = policy.allowed.size > 8 ? ` (+${policy.allowed.size - 8} more)` : "";
-		return {
-			error: `Model \"${model}\" is not in allowlist (${policy.configPath}). Allowed: ${allowedPreview}${extra}`,
-		};
-	}
-
-	const allowedThinking = getAllowedThinkingLevels(policy.metadata.get(model));
-	if (spec.thinking && allowedThinking && !allowedThinking.includes(spec.thinking)) {
-		return {
-			error: `Thinking level \"${spec.thinking}\" is not allowed for model \"${model}\" (${policy.configPath}). Allowed: ${allowedThinking.join(", ")}.`,
-		};
-	}
-
-	return { spec: { ...spec, model } };
+	return { config };
 }
 
 function resolveSpec(
 	agents: AgentConfig[],
-	item: {
-		agent?: string;
-		systemPrompt?: string;
-		model?: string;
-		thinking?: string;
-		tools?: string[];
-		noSkills?: boolean;
-	},
-	policy: ModelPolicy,
+	item: { agent?: string },
+	inlineConfig: InlineConfig,
 ): { spec?: ResolvedSpec; error?: string } {
 	if (item.agent) {
 		const agent = agents.find((a) => a.name === item.agent);
@@ -428,32 +262,27 @@ function resolveSpec(
 			const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 			return { error: `Unknown agent: "${item.agent}". Available agents: ${available}.` };
 		}
-		return enforceModelPolicy(
-			{
+		return {
+			spec: {
 				name: agent.name,
-				model: item.model ?? agent.model,
-				thinking: item.thinking ?? agent.thinking,
-				tools: item.tools ?? agent.tools,
+				model: agent.model,
+				thinking: agent.thinking,
+				tools: agent.tools,
 				systemPrompt: agent.systemPrompt,
-				noSkills: item.noSkills ?? agent.noSkills ?? true,
+				noSkills: agent.noSkills ?? true,
 			},
-			policy,
-		);
+		};
 	}
-	const inlineSystemPrompt = item.systemPrompt?.trim()
-		? INLINE_BASE_SYSTEM_PROMPT + "\n\n" + item.systemPrompt
-		: INLINE_BASE_SYSTEM_PROMPT;
-	return enforceModelPolicy(
-		{
+	return {
+		spec: {
 			name: "inline",
-			model: item.model,
-			thinking: item.thinking,
-			tools: item.tools,
-			systemPrompt: inlineSystemPrompt,
-			noSkills: item.noSkills ?? true,
+			model: inlineConfig.model,
+			thinking: inlineConfig.thinking,
+			tools: inlineConfig.tools,
+			systemPrompt: INLINE_BASE_SYSTEM_PROMPT,
+			noSkills: inlineConfig.noSkills ?? true,
 		},
-		policy,
-	);
+	};
 }
 
 function failedSpecResult(name: string, task: string, error: string): SingleResult {
@@ -470,13 +299,7 @@ function failedSpecResult(name: string, task: string, error: string): SingleResu
 interface RunItem {
 	task: string;
 	agent?: string;
-	systemPrompt?: string;
-	model?: string;
-	thinking?: string;
-	tools?: string[];
-	cwd?: string;
 	label?: string;
-	noSkills?: boolean;
 }
 
 type RunOpts = { label?: string };
@@ -487,12 +310,12 @@ type RunOpts = { label?: string };
 function resolveRunPlan(
 	agents: AgentConfig[],
 	item: RunItem,
-	policy: ModelPolicy,
+	inlineConfig: InlineConfig,
 ): { spec?: ResolvedSpec; opts: RunOpts; error?: string } {
 	const opts: RunOpts = {
 		label: item.label,
 	};
-	const { spec, error } = resolveSpec(agents, item, policy);
+	const { spec, error } = resolveSpec(agents, item, inlineConfig);
 	return { spec, opts, error };
 }
 
@@ -512,27 +335,15 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "policy-blocked"]);
+const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted"]);
 
 function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || NON_SUCCESS_STOP_REASONS.has(result.stopReason ?? "");
 }
 
 /** Single-word status for the model-facing envelope. */
-function resolveReportedModelId(model: string, provider: string | undefined, policy: ModelPolicy): string | undefined {
-	if (policy.allowed.has(model)) return model;
-	if (provider && policy.allowed.has(`${provider}/${model}`)) return `${provider}/${model}`;
-	const matches = Array.from(policy.allowed).filter((id) => id.endsWith(`/${model}`));
-	return matches.length === 1 ? matches[0] : undefined;
-}
-
 function statusOf(result: SingleResult): string {
-	switch (result.stopReason) {
-		case "aborted":
-			return "aborted";
-		case "policy-blocked":
-			return "policy-blocked";
-	}
+	if (result.stopReason === "aborted") return "aborted";
 	return isFailedResult(result) ? "failed" : "done";
 }
 
@@ -622,15 +433,13 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
-	defaultCwd: string,
+	cwd: string,
 	spec: ResolvedSpec,
 	task: string,
-	cwd: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	opts?: { label?: string },
-	policy?: ModelPolicy,
 ): Promise<SingleResult> {
 	// Persist the child's session so the main agent can read the full transcript
 	// for debugging. This is the observability bridge: a path, not a framework.
@@ -693,12 +502,11 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
-		let wasPolicyBlocked = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
+				cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -706,20 +514,6 @@ async function runSingleAgent(
 
 			const killProc = () => {
 				wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-
-			// Defense-in-depth: enforce the allowlist reactively once the child
-			// reports which model it's actually using.
-			const blockForPolicy = (model: string) => {
-				if (wasPolicyBlocked) return;
-				wasPolicyBlocked = true;
-				const allowedPreview = Array.from(policy?.allowed ?? []).slice(0, 8).join(", ") || "(none)";
-				const extra = policy && policy.allowed.size > 8 ? ` (+${policy.allowed.size - 8} more)` : "";
-				currentResult.errorMessage = `Model "${model}" is not in allowlist (${policy?.configPath}). Allowed: ${allowedPreview}${extra}. Killed child to enforce policy.`;
 				proc.kill("SIGTERM");
 				setTimeout(() => {
 					if (!proc.killed) proc.kill("SIGKILL");
@@ -760,14 +554,7 @@ async function runSingleAgent(
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
 						const reportedModel = msg.model as string | undefined;
-						const reportedProvider = (msg as any).provider as string | undefined;
-						if (reportedModel) {
-							const canonicalModel = policy?.enabled
-								? resolveReportedModelId(reportedModel, reportedProvider, policy)
-								: undefined;
-							if (!currentResult.model) currentResult.model = canonicalModel ?? reportedModel;
-							if (policy?.enabled && !canonicalModel) blockForPolicy(reportedModel);
-						}
+						if (reportedModel && !currentResult.model) currentResult.model = reportedModel;
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
@@ -812,8 +599,7 @@ async function runSingleAgent(
 		resolveSessionFile();
 		// Abort no longer throws: return the partial result so completed work
 		// is never discarded and the session path stays inspectable.
-		if (wasPolicyBlocked) currentResult.stopReason = "policy-blocked";
-		else if (wasAborted) currentResult.stopReason = "aborted";
+		if (wasAborted) currentResult.stopReason = "aborted";
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -831,35 +617,12 @@ async function runSingleAgent(
 	}
 }
 
-// Shared param-description fragments: single source of truth, composed into the
-// schema below to avoid copy/paste drift.
-const DESC = {
-	task: "Task for the child.",
-	label: "Correlation label echoed in the result envelope (e.g. repo/feature name).",
-	agent: "Optional named agent. If omitted, runs inline.",
-	systemPrompt:
-		"Inline system prompt, appended to the child's base prompt. Ignored if `agent` is set (the named agent's own prompt is used instead).",
-	model:
-		"Exact model id for a fresh run. If the allowlist is enabled, use an id returned by `listModels`; aliases and provider-less names may be rejected. Omit to use the configured default.",
-	thinking: "Thinking level for a fresh run. Must be permitted for the selected model when the allowlist is enabled.",
-	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
-	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
-	noSkills: "Pass `--no-skills` to the child (disable skill auto-discovery). Defaults to true; set false to keep skills auto-discovered.",
-} as const;
-
 const SubagentParams = Type.Object({
-	task: Type.Optional(Type.String({ description: DESC.task })),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	noSkills: Type.Optional(Type.Boolean({ description: DESC.noSkills })),
-	listModels: Type.Optional(
-		Type.Boolean({ description: "Show exact allowed model ids, thinking levels, benchmark summaries, default, and validation errors. No subagent is spawned." }),
+	task: Type.Optional(Type.String({ description: "Task for the child." })),
+	label: Type.Optional(
+		Type.String({ description: "Correlation label echoed in the result envelope (e.g. repo/feature name)." }),
 	),
-	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
+	agent: Type.Optional(Type.String({ description: "Optional named agent. If omitted, runs inline." })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -895,40 +658,18 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate a task to an isolated child pi process with its own context window.",
 			"To run tasks in parallel, issue multiple `subagent` tool calls in the same turn; the harness executes sibling tool calls concurrently.",
-			"Use `listModels: true` to discover exact allowed model ids and thinking levels.",
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agents = discoverAgents();
-			const { policy: modelPolicy, error: modelPolicyError } = loadModelPolicy();
-			const validationErrors = modelPolicyError ? [] : validateModelPolicy(modelPolicy, ctx.modelRegistry);
+			const { config: inlineConfig, error: configError } = loadInlineConfig();
 
 			const makeDetails = (results: SingleResult[]): SubagentDetails => ({ results });
 
-			if (params.listModels) {
-				const compactModels = compactModelList(modelPolicy);
-				const payload = {
-					allowlistEnabled: modelPolicy.enabled,
-					validationErrors,
-					levelsLegend: "Benchmark summary by allowed thinking level: AA <intelligence>/<coding>/$<cost>; DeepSWE <pass@1>/$<cost>.",
-					default: modelPolicy.defaultModel ?? null,
-					...compactModels,
-					configPath: modelPolicy.configPath,
-					note: modelPolicy.enabled
-						? "Set `model` to a row id; omit to use `default`."
-						: "Allowlist disabled: any harness model may be used; omitting `model` inherits the harness default.",
-				};
+			if (configError) {
 				return {
-					content: [{ type: "text", text: JSON.stringify(payload) }],
-					details: makeDetails([]),
-				};
-			}
-
-			if (modelPolicyError || validationErrors.length > 0) {
-				const errorText = [modelPolicyError, ...validationErrors].filter(Boolean).join("\n");
-				return {
-					content: [{ type: "text", text: errorText }],
+					content: [{ type: "text", text: configError }],
 					details: makeDetails([]),
 					isError: true,
 				};
@@ -947,7 +688,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, modelPolicy);
+			const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, inlineConfig);
 			if (error || !spec) {
 				const failed = failedSpecResult(params.agent ?? "inline", params.task, error ?? "resolve failed");
 				failed.label = params.label;
@@ -961,12 +702,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.cwd,
 				spec,
 				params.task,
-				params.cwd,
 				signal,
 				onUpdate,
 				makeDetails,
 				opts,
-				modelPolicy,
 			);
 			return {
 				content: [{ type: "text", text: buildTaskBlock(result) }],

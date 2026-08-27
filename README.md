@@ -24,7 +24,7 @@ pi -e git:github.com/eggmasonvalue/pi-subagent
 ```
 
 Then `/reload` (or restart pi) and the `subagent` tool is available. See
-[Model allowlist](#model-allowlist-optional-recommended) for the optional one-time config
+[Inline config](#inline-config-optional) for the optional one-time config
 step.
 
 > **Security:** pi packages run with full system access — extensions execute arbitrary
@@ -43,7 +43,7 @@ because this extension is built to answer each one:
 |---|---|
 | **"Black box within a black box."** You can't see what the subagent did. | Each child's **full transcript is persisted to a session JSONL**, and the file path is returned in the result — in a terse `[status=… model=… session=…]` envelope so the supervisor sees *which model ran and how it went* without opening anything. You (or the main agent) can open the JSONL and read every step. |
 | **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **Sessions are inspectable.** Each child writes a normal pi session JSONL: `read` it to diagnose what happened, then dispatch a fresh subagent with a corrected task. Inspect → correct → rerun, no hidden state. |
-| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden. |
+| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task`. Nothing hidden. |
 | **Context pollution.** People reach for subagents mid-session to "save context," then dump tool output back into the parent anyway. | The model only sees the child's **final output** (capped), not its streaming internals. Full detail lives in the session file and tool `details`, off to the side. |
 | **All-or-nothing on interrupt.** Kill a runaway child and you lose the work it already finished. | **Abort flushes partial results.** On Ctrl+C / `/interrupt`, the in-flight child is killed but returns whatever it produced so far with `status=aborted`, and its `session=` path stays attached — inspectable, no sessions-dir archaeology. |
 
@@ -59,9 +59,8 @@ Two features make that real rather than aspirational:
 Popular subagents have every subagent as a human-written `agent.md` persona.
 We removed that as the default. A SOTA supervisor model knows how to frame a sub-task and
 adopt a persona far better than a static file written ahead of time. So by default this
-tool runs **inline**: the main agent supplies the task (and optionally a system prompt) at
-call time. Named agent files are still supported as an *optional* convenience, not a
-requirement.
+tool runs **inline**: the main agent supplies the task at call time. Named agent files
+are still supported as an *optional* convenience, not a requirement.
 
 ---
 
@@ -117,13 +116,12 @@ default, so they run in parallel without an explicit `tasks` array.
 
 ### Per-call options (all optional)
 
-- `systemPrompt` — inline persona/instructions for the child.
-- `model` — e.g. `sonnet`, `provider/id`.
-- `thinking` — optional passthrough to child `--thinking` (no hardcoded validation in this extension).
-- `tools` — allowlist, e.g. `["read", "grep", "find", "ls"]` for a read-only scout.
-- `cwd` — working directory for the child process.
 - `agent` — name of a `*.md` agent file (optional; see below).
 - `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
+
+Model, thinking, tools, and skill-discovery are not per-call options. Inline runs
+use the defaults from [`subagent.json`](#inline-config-optional); named agents carry
+their own `model`/`thinking`/`tools`/`noSkills` in their `*.md` frontmatter.
 
 ### Result envelope
 
@@ -135,9 +133,9 @@ prefixed with one terse machine-parsable line carrying only what the *tool* uniq
 <the child's own final output, verbatim, byte-capped>
 ```
 
-`status` is one of `done` / `failed` / `aborted` / `policy-blocked`. The tool does
+`status` is one of `done` / `failed` / `aborted`. The tool does
 **not** wrap or reformat the child's payload — if you want JSON back, tell the child (via
-`task`/`systemPrompt`) to emit JSON. The rich TUI rendering for the human lives in tool
+`task`) to emit JSON. The rich TUI rendering for the human lives in tool
 `details` and never enters the main agent's context.
 
 ### Abort & partial results
@@ -163,15 +161,6 @@ subagent { task: "You looped on the import. The package is `foo`, not `foo-py`. 
 
 - The `session=` path is for human/agent inspection of a child's full transcript.
 - Works in single mode.
-
-### Discovering models
-
-```
-subagent { listModels: true }
-```
-
-Returns compact model-policy JSON: `columns` plus `models` rows, the resolved `default`,
-whether the policy is enabled, and the config path. No subagent is spawned.
 
 ### Note on progress
 
@@ -202,95 +191,30 @@ thinking: low
 You are a fast scout. Find the relevant code and report concise, cited findings.
 ```
 
-Then: *"use scout to find the auth code"*. Inline `model`/`tools`/`thinking` passed at call
-time override the file's values. `thinking` is optional; when omitted (both in the file and
-the call), the child inherits the dispatching session's thinking level for fresh runs.
+Then: *"use scout to find the auth code"*. The file's `model`/`tools`/`thinking`/`noSkills`
+are the agent's full config; there are no per-call overrides. `thinking` is optional; when
+omitted, the child inherits the dispatching session's thinking level.
 
-### Model allowlist (optional, recommended)
+### Inline config (optional)
 
-To hard-restrict which child models can be used, copy
-`extensions/subagent/models-allowlist.example.json` to:
+Inline subagent runs (calls without an `agent` name) read their defaults from:
 
-`~/.pi/agent/extensions/subagent/models-allowlist.json`
+`~/.pi/agent/subagent.json`
 
-Then edit the copied file with the model IDs and thinking levels you want to allow.
-
-A populated entry looks like this after benchmark data has been refreshed:
+All fields are optional; omit the file entirely to use the child pi process's own
+defaults (default model, default tools, skill discovery on). Example:
 
 ```json
 {
-  "id": "github-copilot/gpt-5.5",
-  "levels": {
-    "high": {
-      "artificialAnalysis": {
-        "intelligence": 55.1,
-        "coding": 70.8,
-        "cost": 4.63
-      },
-      "deepSWE": {
-        "pass": 0.619,
-        "cost": 4.47
-      }
-    },
-    "xhigh": {
-      "artificialAnalysis": {
-        "intelligence": 57.2,
-        "coding": 74.1,
-        "cost": 6.61
-      },
-      "deepSWE": {
-        "pass": 0.700,
-        "cost": 6.61
-      }
-    }
-  },
-  "description": "Strong coding model"
+  "model": "github-copilot/gpt-5.3-codex",
+  "thinking": "low",
+  "tools": ["read", "grep", "find", "ls", "bash"],
+  "noSkills": true
 }
 ```
 
-Artificial Analysis provides composite intelligence, coding, and cost metrics. DeepSWE provides coding-agent pass rate and cost. Either source is optional; an empty source or level means no matching data has been imported yet. Benchmark values are advisory; pi model metadata remains authoritative for capability validation.
-
-It supports either plain model ids (strings) or richer objects with an `id`, optional `levels`, and an optional human-readable `description`. Benchmark values under `levels` are formatted into the compact model-facing output described by `levelsLegend`. Unknown extra fields are preserved in the JSON but are not included in the compact `listModels` response:
-
-```json
-{
-  "enabled": true,
-  "allowed": [
-    {
-      "id": "github-copilot/gpt-5.3-codex",
-      "levels": {
-        "low": {},
-        "medium": {},
-        "high": {},
-        "xhigh": {}
-      },
-      "description": "Great default for most coding tasks"
-    },
-  ],
-  "default": "github-copilot/gpt-5.3-codex"
-}
-```
-
-Behavior when enabled:
-
-- Effective model resolution is: inline `model` → named-agent `model` → allowlist `default`.
-- The resolved model must match an allowed `id` exactly.
-- **`levels` is enforced, not just descriptive.** If an allowed entry includes a `levels` object, the resolved `thinking` value must be one of its keys or the call fails. Remove a level key (e.g. remove `"xhigh"`) to block it for that model. Omit the `levels` key on an entry entirely to leave thinking unrestricted for that model.
-- If no model resolves and no `default` is set, the call fails early.
-- If the file is missing, policy is disabled (legacy behavior).
-
-### Refreshing benchmark data
-
-The allowlist is edited directly in `models-allowlist.json`. To refresh the optional
-per-level data for configured entries, run from the package checkout:
-
-```bash
-bun extensions/subagent/refresh-aa-benchmarks.ts
-bun extensions/subagent/refresh-deepswe-benchmarks.ts
-```
-
-Missing benchmark pages or rows are reported as warnings and do not remove configured
-models or thinking levels. Benchmark data is advisory; runtime validation uses pi's model metadata.
+Named agents are not affected by this file — they carry their own
+`model`/`thinking`/`tools`/`noSkills` in their `*.md` frontmatter.
 
 ---
 
@@ -337,10 +261,7 @@ pi-subagent/
 └── extensions/
     └── subagent/
         ├── index.ts                      # the extension (tool registration, spawning, rendering)
-        ├── agents.ts                     # optional named-agent discovery
-        ├── models-allowlist.example.json # policy template
-        ├── refresh-aa-benchmarks.ts     # refreshes per-level Artificial Analysis data
-        └── refresh-deepswe-benchmarks.ts # refreshes per-level DeepSWE data
+        └── agents.ts                     # optional named-agent discovery
 ```
 
 ## Reload
