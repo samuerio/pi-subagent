@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 		execute: (id, params, signal, onUpdate, ctx) => finder.execute(id, params, signal, onUpdate, ctx),
 		renderCall: (args, theme, _context) => finder.renderCall(args, theme),
-		renderResult: (result, opts, theme, _context) => finder.renderResult(result, opts, theme),
+		renderResult: (result, opts, theme, context) => finder.renderResult(result, opts, theme, context),
 	});
 
 	const oracle = new Subagent(ORACLE_SPEC);
@@ -97,7 +97,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 		execute: (id, params, signal, onUpdate, ctx) => oracle.execute(id, params, signal, onUpdate, ctx),
 		renderCall: (args, theme, _context) => oracle.renderCall(args, theme),
-		renderResult: (result, opts, theme, _context) => oracle.renderResult(result, opts, theme),
+		renderResult: (result, opts, theme, context) => oracle.renderResult(result, opts, theme, context),
 	});
 
 	// --- Inline subagent: config is read per call from subagent.json, so a
@@ -114,10 +114,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { config: inlineConfig, error: configError } = loadInlineConfig();
 			if (configError) {
-				return {
-					content: [{ type: "text", text: configError }],
-					details: { results: [] },
-				};
+				throw new Error(configError);
 			}
 			const inlineSpec: SubagentSpec = {
 				name: "subagent",
@@ -142,7 +139,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, opts, theme, _context) {
+		renderResult(result, opts, theme, context) {
 			// Render depends only on result.details, not on runtime config, so a
 			// default instance suffices here.
 			const instance = new Subagent({
@@ -150,7 +147,7 @@ export default function (pi: ExtensionAPI) {
 				systemPrompt: "",
 				noSkills: true,
 			});
-			return instance.renderResult(result, opts, theme);
+			return instance.renderResult(result, opts, theme, context);
 		},
 	});
 }

@@ -41,7 +41,7 @@ export interface SubagentSpec {
 
 /** Model-facing parameters: only `task`. No per-call config. */
 export const SubagentParams = Type.Object({
-	task: Type.Optional(Type.String({ description: "Task for the child." })),
+	task: Type.String({ description: "Task for the child." }),
 });
 
 interface UsageStats {
@@ -288,17 +288,6 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
-function failedSpecResult(name: string, task: string, error: string): SingleResult {
-	return {
-		agent: name,
-		task,
-		exitCode: 1,
-		messages: [],
-		stderr: error,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-	};
-}
-
 /**
  * A Subagent instance binds a `SubagentSpec` to the spawn/parse/envelope/render
  * machinery. Specialized subagents (finder, oracle) use a static spec; the
@@ -507,11 +496,6 @@ export class Subagent {
 		return isFailedResult(result);
 	}
 
-	/** Convenience for error-path results that still need a SingleResult shape. */
-	failedResult(task: string, error: string): SingleResult {
-		return failedSpecResult(this.spec.name, task, error);
-	}
-
 	/**
 	 * Standard tool execute body shared by all subagent tools. Spawns the child
 	 * for `params.task`, returns the envelope + verbatim output. The inline
@@ -520,20 +504,20 @@ export class Subagent {
 	 */
 	async execute(
 		_toolCallId: string,
-		params: { task?: string },
+		params: { task: string },
 		signal: AbortSignal | undefined,
 		onUpdate: OnUpdateCallback | undefined,
 		ctx: { cwd: string },
 	): Promise<AgentToolResult<SubagentDetails>> {
 		const makeDetails = (results: SingleResult[]): SubagentDetails => ({ results });
-		if (!params.task) {
-			const failed = this.failedResult("", "`task` is required");
-			return {
-				content: [{ type: "text", text: "Invalid parameters. Provide a `task`." }],
-				details: makeDetails([failed]),
-			};
-		}
 		const result = await this.run(ctx.cwd, params.task, signal, onUpdate, makeDetails);
+		// Signal failure the way pi expects (docs/extensions.md: "Signaling errors"):
+		// throw from execute. The harness catches it, sets isError=true on the result,
+		// and reports it to the LLM. details are wiped by createErrorToolResult, so the
+		// envelope + verbatim child output ride in the thrown Error message instead.
+		if (this.isFailed(result)) {
+			throw new Error(this.buildTaskBlock(result));
+		}
 		return {
 			content: [{ type: "text", text: this.buildTaskBlock(result) }],
 			details: makeDetails([result]),
@@ -554,11 +538,19 @@ export class Subagent {
 		result: { content: Array<{ type: string; text?: string }>; details?: unknown },
 		{ expanded }: { expanded: boolean },
 		theme: any,
+		context?: { isError?: boolean },
 	): Text | Container {
+		// On the throw path, createErrorToolResult wipes details to {}. Guard for
+		// that: details.results may be undefined. Render from content alone.
 		const details = result.details as SubagentDetails | undefined;
-		if (!details || details.results.length === 0) {
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		const results = details?.results;
+		if (!results || results.length === 0) {
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "(no output)";
+			// On the throw path the harness already renders the tool-name header;
+			// mirror unified-edit and just dye the content (envelope + child
+			// output) in error color, without an extra icon/name row.
+			if (context?.isError) return new Text(theme.fg("error", text), 0, 0);
+			return new Text(text, 0, 0);
 		}
 
 		const mdTheme = getMarkdownTheme();
@@ -579,20 +571,16 @@ export class Subagent {
 			return text.trimEnd();
 		};
 
+		// Success path: execute only returns (with details) on success; failures
+		// throw and are rendered via the empty-details branch above. Mirror
+		// unified-edit: render just the body, no icon/tool-name header (the
+		// harness renders the call header).
 		const r = details.results[0];
-		const isError = isFailedResult(r);
-		const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 		const displayItems = getDisplayItems(r.messages);
 		const finalOutput = getFinalOutput(r.messages);
 
 		if (expanded) {
 			const container = new Container();
-			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
-			if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-			container.addChild(new Text(header, 0, 0));
-			if (isError && r.errorMessage)
-				container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 			container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 			container.addChild(new Spacer(1));
@@ -623,17 +611,16 @@ export class Subagent {
 			return container;
 		}
 
-		let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
-		if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-		if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-		else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-		else {
-			text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+		let text = "";
+		if (displayItems.length === 0) {
+			text = theme.fg("muted", "(no output)");
+		} else {
+			text = renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT);
 			if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 		}
 		const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-		if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-		if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
+		if (usageStr) text += `${text ? "\n" : ""}${theme.fg("dim", usageStr)}`;
+		if (r.sessionFile) text += `${text ? "\n" : ""}${theme.fg("dim", `session: ${r.sessionFile}`)}`;
 		return new Text(text, 0, 0);
 	}
 }
