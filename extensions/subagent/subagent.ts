@@ -11,7 +11,7 @@
  * per call from `~/.pi/agent/subagent.json`.
  *
  * Architecture Invariant: the model-facing tool parameters are only `task` and
- * `label`. model/thinking/tools/noSkills are NOT per-call params; they live in
+ * model/thinking/tools/noSkills are NOT per-call params; they live in
  * the spec (code constants for specialized, subagent.json for inline).
  */
 
@@ -39,12 +39,9 @@ export interface SubagentSpec {
 	noSkills: boolean;
 }
 
-/** Model-facing parameters: only `task` and `label`. No `agent`, no per-call config. */
+/** Model-facing parameters: only `task`. No per-call config. */
 export const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task for the child." })),
-	label: Type.Optional(
-		Type.String({ description: "Correlation label echoed in the result envelope (e.g. repo/feature name)." }),
-	),
 });
 
 interface UsageStats {
@@ -60,8 +57,6 @@ interface UsageStats {
 export interface SingleResult {
 	agent: string;
 	task: string;
-	/** Optional caller-supplied correlation label, echoed in the model-facing envelope. */
-	label?: string;
 	thinking?: string;
 	exitCode: number;
 	messages: Message[];
@@ -80,7 +75,7 @@ export interface SubagentDetails {
 	results: SingleResult[];
 }
 
-type RunOpts = { label?: string };
+type RunOpts = Record<string, never>;
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
@@ -215,12 +210,11 @@ function statusOf(result: SingleResult): string {
 
 /**
  * The terse, model-facing header line. Carries only what the *tool* uniquely
- * knows (status, model, label, session, cost). The child's own output is passed
+ * knows (status, model, session, cost). The child's own output is passed
  * through verbatim by the caller — the tool does not impose a payload format.
  */
 function buildEnvelope(result: SingleResult): string {
 	const parts: string[] = [];
-	if (result.label) parts.push(`label=${result.label}`);
 	parts.push(`agent=${result.agent}`);
 	parts.push(`status=${statusOf(result)}`);
 	if (result.model) parts.push(`model=${result.model}`);
@@ -350,7 +344,6 @@ export class Subagent {
 		const currentResult: SingleResult = {
 			agent: spec.name,
 			task,
-			label: opts?.label,
 			exitCode: 0,
 			messages: [],
 			stderr: "",
@@ -527,7 +520,7 @@ export class Subagent {
 	 */
 	async execute(
 		_toolCallId: string,
-		params: { task?: string; label?: string },
+		params: { task?: string },
 		signal: AbortSignal | undefined,
 		onUpdate: OnUpdateCallback | undefined,
 		ctx: { cwd: string },
@@ -535,13 +528,12 @@ export class Subagent {
 		const makeDetails = (results: SingleResult[]): SubagentDetails => ({ results });
 		if (!params.task) {
 			const failed = this.failedResult("", "`task` is required");
-			failed.label = params.label;
 			return {
 				content: [{ type: "text", text: "Invalid parameters. Provide a `task`." }],
 				details: makeDetails([failed]),
 			};
 		}
-		const result = await this.run(ctx.cwd, params.task, signal, onUpdate, makeDetails, { label: params.label });
+		const result = await this.run(ctx.cwd, params.task, signal, onUpdate, makeDetails);
 		return {
 			content: [{ type: "text", text: this.buildTaskBlock(result) }],
 			details: makeDetails([result]),

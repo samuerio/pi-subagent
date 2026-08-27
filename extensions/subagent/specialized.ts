@@ -4,7 +4,7 @@
  * Each specialized subagent (finder, oracle) is a code-level `SubagentSpec`
  * constant (pure agent runtime params: systemPrompt/model/thinking/tools/
  * noSkills) plus a separate tool-description constant (the model's discovery
- * surface). Tool registration metadata (label/description) is passed
+ * surface). Tool registration metadata is passed
  * explicitly at the `pi.registerTool` call site in `index.ts`, not baked into
  * the spec. Adding a third specialized subagent = add a SPEC constant + a
  * DESCRIPTION constant + a registration block in `index.ts`.
