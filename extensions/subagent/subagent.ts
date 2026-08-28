@@ -531,10 +531,10 @@ export class Subagent {
 	}
 
 	renderCall(args: Record<string, unknown>, theme: any): Text {
-		// Show the model-provided short description under the tool name. The full
-		// prompt is displayed in renderResult, not here.
+		// Show the model-provided short description inline after the tool name. The
+		// full prompt is displayed in renderResult, not here.
 		const description = typeof args.description === "string" ? args.description : "...";
-		const text = `${theme.fg("toolTitle", theme.bold(this.spec.name))}\n  ${theme.fg("dim", description)}`;
+		const text = `${theme.fg("toolTitle", theme.bold(this.spec.name))} ${theme.fg("muted", description)}`;
 		return new Text(text, 0, 0);
 	}
 
