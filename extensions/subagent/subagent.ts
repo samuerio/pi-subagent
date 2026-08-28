@@ -253,6 +253,32 @@ function truncateOutput(output: string): string {
 	}
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
+/** Identity color fn: strips theme colors for plain-text contexts (error throw). */
+const plainFg = (_color: any, text: string): string => text;
+
+/**
+ * Collapsed (non-expanded) text: last N tool-call lines + usage + session path.
+ * `themeFg` controls coloring; pass `plainFg` for uncolored plain text.
+ */
+function buildCollapsedText(
+	result: SingleResult,
+	themeFg: (color: any, text: string) => string,
+): string {
+	const displayItems = getDisplayItems(result.messages);
+	const toolCalls = displayItems.filter((it) => it.type === "toolCall");
+	let text = "";
+	const toShow = toolCalls.slice(-COLLAPSED_ITEM_COUNT);
+	const skipped = toolCalls.length > COLLAPSED_ITEM_COUNT ? toolCalls.length - COLLAPSED_ITEM_COUNT : 0;
+	if (skipped > 0) text += themeFg("muted", `... ${skipped} earlier calls\n`);
+	for (const item of toShow) {
+		text += `${themeFg("muted", "→ ") + formatToolCall((item as { name: string; args: Record<string, any> }).name, (item as { name: string; args: Record<string, any> }).args, themeFg)}\n`;
+	}
+	text = text.trimEnd();
+	const usageStr = formatUsageStats(result.usage, result.model, result.thinking);
+	if (usageStr) text += `${text ? "\n" : ""}${themeFg("dim", usageStr)}`;
+	if (result.sessionFile) text += `${text ? "\n" : ""}${themeFg("dim", `session: ${result.sessionFile}`)}`;
+	return text;
+}
 
 function getResultOutput(result: SingleResult): string {
 	if (isFailedResult(result)) {
@@ -526,9 +552,14 @@ export class Subagent {
 		// Signal failure the way pi expects (docs/extensions.md: "Signaling errors"):
 		// throw from execute. The harness catches it, sets isError=true on the result,
 		// and reports it to the LLM. details are wiped by createErrorToolResult, so the
-		// envelope + verbatim child output ride in the thrown Error message instead.
+		// failure reason rides in the thrown Error message instead.
 		if (this.isFailed(result)) {
-			throw new Error(this.buildTaskBlock(result));
+			// Throw plain text: collapsed layout (tool calls + usage + session) with
+			// a final `Error:<reason>` line. No theme colors — the harness dyes the
+			// whole thrown message in error color regardless.
+			const collapsed = buildCollapsedText(result, plainFg);
+			const reason = result.stopReason === "aborted" ? "abort" : (result.errorMessage || "unknown");
+			throw new Error([collapsed, `Error: ${reason}`].filter(Boolean).join("\n\n"));
 		}
 		return {
 			content: [{ type: "text", text: this.buildTaskBlock(result) }],
@@ -564,22 +595,6 @@ export class Subagent {
 		}
 
 		const mdTheme = getMarkdownTheme();
-
-		const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-			const toShow = limit ? items.slice(-limit) : items;
-			const skipped = limit && items.length > limit ? items.length - limit : 0;
-			let text = "";
-			if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-			for (const item of toShow) {
-				if (item.type === "text") {
-					const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-					text += `${theme.fg("toolOutput", preview)}\n`;
-				} else {
-					text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-				}
-			}
-			return text.trimEnd();
-		};
 
 		// Success path: execute only returns (with details) on success; failures
 		// throw and are rendered via the empty-details branch above. Mirror
@@ -621,16 +636,7 @@ export class Subagent {
 			return container;
 		}
 
-		let text = "";
-		if (displayItems.length === 0) {
-			text = theme.fg("muted", "(no output)");
-		} else {
-			text = renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT);
-			if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-		}
-		const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-		if (usageStr) text += `${text ? "\n" : ""}${theme.fg("dim", usageStr)}`;
-		if (r.sessionFile) text += `${text ? "\n" : ""}${theme.fg("dim", `session: ${r.sessionFile}`)}`;
+		const text = buildCollapsedText(r, theme.fg.bind(theme));
 		return new Text(text, 0, 0);
 	}
 }
