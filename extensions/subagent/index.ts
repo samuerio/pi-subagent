@@ -4,7 +4,7 @@
  * Registers three native pi tools:
  *   - `finder`  : specialized code-search subagent (baked-in spec).
  *   - `oracle`  : specialized reasoning-advisor subagent (baked-in spec).
- *   - `subagent`: inline, general-purpose subagent; config read per-call from
+ *   - `task`    : inline, general-purpose subagent; config read per-call from
  *                 `~/.pi/agent/subagent.json`. Because finder/oracle are also
  *                 tools, an inline subagent can whitelist them and call them
  *                 from inside its child context (grandchild pi process).
@@ -17,7 +17,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import {
 	FINDER_DESCRIPTION,
 	FINDER_SPEC,
@@ -100,14 +99,22 @@ export default function (pi: ExtensionAPI) {
 		renderResult: (result, opts, theme, context) => oracle.renderResult(result, opts, theme, context),
 	});
 
-	// --- Inline subagent: config is read per call from subagent.json, so a
+	// --- Inline `task` tool: config is read per call from subagent.json, so a
 	// fresh Subagent is constructed each invocation with a runtime-resolved spec.
+	// Rendering depends only on result.details (not runtime config), so a shared
+	// default instance backs renderCall/renderResult — same pattern as
+	// finder/oracle above.
+	const defaultTaskInstance = new Subagent({
+		name: "task",
+		systemPrompt: "",
+		noSkills: true,
+	});
 	pi.registerTool({
-		name: "subagent",
-		label: "Subagent",
+		name: "task",
+		label: "Task",
 		description: [
 			"Delegate a task to an isolated child pi process with its own context window.",
-			"To run tasks in parallel, issue multiple `subagent` tool calls in the same turn; the harness executes sibling tool calls concurrently.",
+			"To run tasks in parallel, issue multiple `task` tool calls in the same turn; the harness executes sibling tool calls concurrently.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -117,7 +124,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(configError);
 			}
 			const inlineSpec: SubagentSpec = {
-				name: "subagent",
+				name: "task",
 				systemPrompt: INLINE_BASE_SYSTEM_PROMPT,
 				model: inlineConfig.model,
 				thinking: inlineConfig.thinking,
@@ -128,26 +135,7 @@ export default function (pi: ExtensionAPI) {
 			return instance.execute(_toolCallId, params, signal, onUpdate, ctx);
 		},
 
-		renderCall(args, theme, _context) {
-			const preview = args.task
-				? (args.task as string).length > 60
-					? `${(args.task as string).slice(0, 60)}...`
-					: (args.task as string)
-				: "...";
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", "inline");
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, opts, theme, context) {
-			// Render depends only on result.details, not on runtime config, so a
-			// default instance suffices here.
-			const instance = new Subagent({
-				name: "subagent",
-				systemPrompt: "",
-				noSkills: true,
-			});
-			return instance.renderResult(result, opts, theme, context);
-		},
+		renderCall: (args, theme) => defaultTaskInstance.renderCall(args, theme),
+		renderResult: (result, opts, theme, context) => defaultTaskInstance.renderResult(result, opts, theme, context),
 	});
 }

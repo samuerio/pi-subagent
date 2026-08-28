@@ -15,7 +15,7 @@ import type { SubagentSpec } from "./subagent.ts";
 /**
  * Base system prompt for the inline `subagent` tool (no specialized persona).
  * Replaces the verbose default coding-assistant prompt so the child gets a lean,
- * focused persona. The caller's instructions go into the `task`. Mentions
+ * focused persona. The caller's instructions go into the `prompt`. Mentions
  * `finder` because finder is now a native tool the inline child may whitelist.
  */
 export const INLINE_BASE_SYSTEM_PROMPT = `You are pi, a powerful AI coding agent.

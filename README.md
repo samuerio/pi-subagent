@@ -23,13 +23,13 @@ pi install npm:@eggmasonvalue/pi-subagent
 pi -e git:github.com/eggmasonvalue/pi-subagent
 ```
 
-Then `/reload` (or restart pi) and the `subagent` tool is available. See
+Then `/reload` (or restart pi) and the `task` tool is available. See
 [Inline config](#inline-config-optional) for the optional one-time config
 step.
 
 > **Security:** pi packages run with full system access — extensions execute arbitrary
 > code. Review the source before installing. This one spawns child `pi` processes and
-> reads/writes session JSONL under `~/.pi/agent/sessions/subagent/`.
+> reads/writes session JSONL under `~/.pi/agent/sessions/task/`.
 
 ---
 
@@ -68,8 +68,8 @@ are still supported as an *optional* convenience, not a requirement.
 
 ```
 main pi session
-   └─ subagent tool call
-        └─ spawns:  pi --mode json -p --session-dir <run-dir> [--model ...] [--tools ...] "Task: ..."
+   └─ task tool call
+        └─ spawns:  pi --mode json -p --session-dir <run-dir> [--model ...] [--tools ...] "<prompt>"
               ├─ streams progress to YOU (the human) live, in the tool row
               ├─ writes its full conversation to <run-dir>/<timestamp>_<uuid>.jsonl
               └─ returns a concise final output (+ session path) to the MAIN AGENT
@@ -80,14 +80,14 @@ Two streams, deliberately separated:
 - **To the human:** live streaming of tool calls and progress (observability). This does
   **not** enter the main agent's context.
 - **To the main agent:** only the final output, byte-capped, prefixed with a terse
-  `[key=value …]` envelope (status, model, `label`, `session=<path>`, cost) so it can
+  `[key=value …]` envelope (status, model, `session=<path>`, cost) so it can
   correlate quality↔model and read the full trace if it wants to verify or debug.
   See [Result envelope](#result-envelope).
 
 Child sessions are written under:
 
 ```
-~/.pi/agent/sessions/subagent/<runId>/<session>.jsonl
+~/.pi/agent/sessions/task/<runId>/<session>.jsonl
 ```
 
 ---
@@ -101,7 +101,7 @@ decides to use the tool. Examples:
 Scan this repo in an isolated context and tell me where auth is handled.
 
 Run 3 subagents in parallel: one to map the data models, one the API routes,
-one the background jobs. Summarize each. (Issue three `subagent` calls in the
+one the background jobs. Summarize each. (Issue three `task` calls in the
 same turn; the harness runs them concurrently.)
 
 Sequence: have a subagent find the rate-limiting code, then ask the main
@@ -110,14 +110,13 @@ agent to dispatch another subagent to propose a fix based on what it found.
 
 ### Mode
 
-One task per call: `{ task }`. To fan out, issue multiple `subagent` tool calls
+One task per call: `{ prompt, description }`. To fan out, issue multiple `task` tool calls
 in the same turn — the pi harness executes sibling tool calls concurrently by
 default, so they run in parallel without an explicit `tasks` array.
 
 ### Per-call options (all optional)
 
 - `agent` — name of a `*.md` agent file (optional; see below).
-- `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
 
 Model, thinking, tools, and skill-discovery are not per-call options. Inline runs
 use the defaults from [`subagent.json`](#inline-config-optional); named agents carry
@@ -129,7 +128,7 @@ Subagent output is consumed by the **main agent**, not a human, so each task's r
 prefixed with one terse machine-parsable line carrying only what the *tool* uniquely knows:
 
 ```
-[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex thinking=low turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
+[agent=task status=done model=github-copilot/gpt-5.3-codex thinking=low turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
 <the child's own final output, verbatim, byte-capped>
 ```
 
@@ -152,11 +151,11 @@ field. `read` it to diagnose what happened, then dispatch a fresh subagent with 
 task if needed:
 
 ```
-# the result envelope showed: session=/…/sessions/subagent/<runId>/<id>.jsonl
-read /…/sessions/subagent/<runId>/<id>.jsonl
+# the result envelope showed: session=/…/sessions/task/<runId>/<id>.jsonl
+read /…/sessions/task/<runId>/<id>.jsonl
 
 # then rerun with a corrected task:
-subagent { task: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests." }
+task { prompt: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests.", description: "Fix the import loop" }
 ```
 
 - The `session=` path is for human/agent inspection of a child's full transcript.
@@ -177,7 +176,7 @@ If you *do* want reusable personas, drop markdown files in:
 
 The extension automatically injects the available-agent list into the agent's
 system prompt at session start, so the model knows which `agent` names it can
-pass to `subagent` without you hand-writing an `AGENTS.md` entry. Edit agent
+pass to `task` without you hand-writing an `AGENTS.md` entry. Edit agent
 files and `/reload` to refresh the injected list.
 ```markdown
 ---
@@ -235,7 +234,7 @@ When a child's summary looks off, let you or the agent read the receipts:
 ```bash
 # the session path is shown live in the tool row as soon as the child starts,
 # and is included in the final result, e.g.
-~/.pi/agent/sessions/subagent/1718000000000-ab12cd/2026....jsonl
+~/.pi/agent/sessions/task/1718000000000-ab12cd/2026....jsonl
 
 # inspect it
 pi --session <that-file>      # browse with /tree

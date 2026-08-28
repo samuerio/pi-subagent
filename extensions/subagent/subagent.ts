@@ -10,7 +10,8 @@
  * baked-in specs; the inline `subagent` tool constructs a transient instance
  * per call from `~/.pi/agent/subagent.json`.
  *
- * Architecture Invariant: the model-facing tool parameters are only `task` and
+ * Architecture Invariant: the model-facing tool parameters are only `prompt`
+ * and `description`;
  * model/thinking/tools/noSkills are NOT per-call params; they live in
  * the spec (code constants for specialized, subagent.json for inline).
  */
@@ -39,9 +40,14 @@ export interface SubagentSpec {
 	noSkills: boolean;
 }
 
-/** Model-facing parameters: only `task`. No per-call config. */
+/** Model-facing parameters: `prompt` (the child's task) and `description` (short label). */
 export const SubagentParams = Type.Object({
-	task: Type.String({ description: "Task for the child." }),
+	prompt: Type.String({
+		description: "The task for the agent to perform. Be specific about what needs to be done and include any relevant context.",
+	}),
+	description: Type.String({
+		description: "A very short description of the task that can be displayed to the user.",
+	}),
 });
 
 interface UsageStats {
@@ -56,7 +62,7 @@ interface UsageStats {
 
 export interface SingleResult {
 	agent: string;
-	task: string;
+	prompt: string;
 	thinking?: string;
 	exitCode: number;
 	messages: Message[];
@@ -297,14 +303,14 @@ export class Subagent {
 	constructor(readonly spec: SubagentSpec) {}
 
 	/**
-	 * Spawn an isolated child `pi --mode json -p` process for `task`, parse its
+	 * Spawn an isolated child `pi --mode json -p` process for `prompt`, parse its
 	 * JSON event stream, and return a terse envelope + verbatim output. The
 	 * child's session is persisted under `sessions/<spec.name>/<runId>/` so
 	 * aborted work stays inspectable.
 	 */
 	async run(
 		cwd: string,
-		task: string,
+		prompt: string,
 		signal: AbortSignal | undefined,
 		onUpdate: OnUpdateCallback | undefined,
 		makeDetails: (results: SingleResult[]) => SubagentDetails,
@@ -332,7 +338,7 @@ export class Subagent {
 
 		const currentResult: SingleResult = {
 			agent: spec.name,
-			task,
+			prompt,
 			exitCode: 0,
 			messages: [],
 			stderr: "",
@@ -369,7 +375,7 @@ export class Subagent {
 				args.push("--system-prompt", tmpPromptPath);
 			}
 
-			args.push(`Task: ${task}`);
+			args.push(prompt);
 			let wasAborted = false;
 
 			const exitCode = await new Promise<number>((resolve) => {
@@ -498,19 +504,19 @@ export class Subagent {
 
 	/**
 	 * Standard tool execute body shared by all subagent tools. Spawns the child
-	 * for `params.task`, returns the envelope + verbatim output. The inline
+	 * for `params.prompt`, returns the envelope + verbatim output. The inline
 	 * subagent also uses this after constructing a transient instance from
 	 * subagent.json.
 	 */
 	async execute(
 		_toolCallId: string,
-		params: { task: string },
+		params: { prompt: string; description: string },
 		signal: AbortSignal | undefined,
 		onUpdate: OnUpdateCallback | undefined,
 		ctx: { cwd: string },
 	): Promise<AgentToolResult<SubagentDetails>> {
 		const makeDetails = (results: SingleResult[]): SubagentDetails => ({ results });
-		const result = await this.run(ctx.cwd, params.task, signal, onUpdate, makeDetails);
+		const result = await this.run(ctx.cwd, params.prompt, signal, onUpdate, makeDetails);
 		// Signal failure the way pi expects (docs/extensions.md: "Signaling errors"):
 		// throw from execute. The harness catches it, sets isError=true on the result,
 		// and reports it to the LLM. details are wiped by createErrorToolResult, so the
@@ -525,12 +531,10 @@ export class Subagent {
 	}
 
 	renderCall(args: Record<string, unknown>, theme: any): Text {
-		const preview = args.task
-			? (args.task as string).length > 60
-				? `${(args.task as string).slice(0, 60)}...`
-				: (args.task as string)
-			: "...";
-		const text = `${theme.fg("toolTitle", theme.bold(this.spec.name))}\n  ${theme.fg("dim", preview)}`;
+		// Show the model-provided short description under the tool name. The full
+		// prompt is displayed in renderResult, not here.
+		const description = typeof args.description === "string" ? args.description : "...";
+		const text = `${theme.fg("toolTitle", theme.bold(this.spec.name))}\n  ${theme.fg("dim", description)}`;
 		return new Text(text, 0, 0);
 	}
 
@@ -581,8 +585,8 @@ export class Subagent {
 
 		if (expanded) {
 			const container = new Container();
-			container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-			container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+			container.addChild(new Text(theme.fg("muted", "─── Prompt ───"), 0, 0));
+			container.addChild(new Text(theme.fg("dim", r.prompt), 0, 0));
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
 			if (displayItems.length === 0 && !finalOutput) {
