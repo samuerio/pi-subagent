@@ -184,6 +184,12 @@ function formatToolCall(
 				themeFg("dim", ` in ${shortenPath(rawPath)}`)
 			);
 		}
+		case "finder":
+		case "oracle":
+		case "task": {
+			const description = typeof args.description === "string" ? args.description : "...";
+			return themeFg("muted", `${toolName} `) + themeFg("toolOutput", description);
+		}
 		default: {
 			const argsStr = JSON.stringify(args);
 			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
