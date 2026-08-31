@@ -5,3 +5,4 @@ node_modules/
 
 # Local subagent policy (keep the example tracked)
 extensions/subagent/models-allowlist.json
+/.worktree/
