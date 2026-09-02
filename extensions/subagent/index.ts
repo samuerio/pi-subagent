@@ -109,13 +109,11 @@ export default function (pi: ExtensionAPI) {
 		systemPrompt: "",
 		noSkills: true,
 	});
+	const { config: taskInlineConfig } = loadInlineConfig();
 	pi.registerTool({
 		name: "task",
 		label: "Task",
-		description: [
-			"Delegate a task to an isolated child pi process with its own context window.",
-			"To run tasks in parallel, issue multiple `task` tool calls in the same turn; the harness executes sibling tool calls concurrently.",
-		].join(" "),
+		description: `Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools: ${taskInlineConfig.tools && taskInlineConfig.tools.length > 0 ? taskInlineConfig.tools.join(", ") : ""}`,
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
