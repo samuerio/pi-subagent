@@ -1,13 +1,16 @@
 /**
  * Subagent extension entry.
  *
- * Registers three native pi tools:
- *   - `finder`  : specialized code-search subagent (baked-in spec).
- *   - `oracle`  : specialized reasoning-advisor subagent (baked-in spec).
- *   - `task`    : inline, general-purpose subagent; config read per-call from
- *                 `~/.pi/agent/subagent.json`. Because finder/oracle are also
- *                 tools, an inline subagent can whitelist them and call them
- *                 from inside its child context (grandchild pi process).
+ * Registers four native pi tools:
+ *   - `finder`       : specialized code-search subagent (baked-in spec).
+ *   - `oracle`       : specialized reasoning-advisor subagent (baked-in spec).
+ *   - `task`         : inline, general-purpose subagent; config read per-call
+ *                      from `~/.pi/agent/subagent.json`. Because finder/oracle
+ *                      are also tools, an inline subagent can whitelist them
+ *                      and call them from inside its child context (grandchild
+ *                      pi process).
+ *   - `read_session` : read-only viewer for pi session JSONL files (e.g. the
+ *                      `session=` path a subagent envelope reports).
  *
  * The spawn/parse/envelope/render machinery + the standard execute body live
  * in the `Subagent` class (`subagent.ts`); specialized specs + description
@@ -16,7 +19,14 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	READ_SESSION_DESCRIPTION,
+	ReadSessionParams,
+	readSession,
+	type ReadSessionDetails,
+} from "./read-session.ts";
 import {
 	FINDER_DESCRIPTION,
 	FINDER_SPEC,
@@ -135,5 +145,20 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall: (args, theme) => defaultTaskInstance.renderCall(args, theme),
 		renderResult: (result, opts, theme, context) => defaultTaskInstance.renderResult(result, opts, theme, context),
+	});
+
+	// --- read_session: read-only viewer for pi session JSONL files. No custom
+	// rendering; the harness's fallback renderer shows the returned transcript
+	// text as-is (docs/extensions.md: undefined slots use fallback rendering).
+	pi.registerTool({
+		name: "read_session",
+		label: "Read Session",
+		description: READ_SESSION_DESCRIPTION,
+		parameters: ReadSessionParams,
+
+		async execute(_toolCallId, params): Promise<AgentToolResult<ReadSessionDetails>> {
+			const { text, details } = await readSession(params.path, params.leafId);
+			return { content: [{ type: "text", text }], details };
+		},
 	});
 }
