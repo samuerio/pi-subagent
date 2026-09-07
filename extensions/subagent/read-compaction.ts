@@ -83,8 +83,8 @@ export async function readSessionCompaction(
 	session: string,
 	entryId: string,
 ): Promise<{ text: string; details: ReadSessionCompactionDetails }> {
-	const sessionPath = await resolveSessionRef(session, "read_session_compaction");
-	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath, "read_session_compaction");
+	const sessionPath = await resolveSessionRef(session);
+	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath);
 
 	const target = sessionEntries.find((entry) => entry.id === entryId);
 	if (!target) {

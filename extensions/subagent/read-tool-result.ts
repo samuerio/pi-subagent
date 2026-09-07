@@ -86,8 +86,8 @@ export async function readSessionToolResult(
 	session: string,
 	entryId: string,
 ): Promise<{ text: string; details: ReadToolResultDetails }> {
-	const sessionPath = await resolveSessionRef(session, "read_session_tool_result");
-	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath, "read_session_tool_result");
+	const sessionPath = await resolveSessionRef(session);
+	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath);
 
 	const target = sessionEntries.find((entry) => entry.id === entryId);
 	if (!target) {

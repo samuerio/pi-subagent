@@ -94,7 +94,14 @@ export const ReadSessionParams = Type.Object({
 
 export interface ReadSessionDetails {
 	path: string;
+	/**
+	 * Resolved active-branch entry count (`buildContextEntries(sessionEntries, leafId).length`):
+	 * the entries that back the returned transcript, after branch/compaction resolution.
+	 * NOT the raw on-disk entry total (which also counts other branches and entries that a
+	 * compaction summarized away).
+	 */
 	entryCount: number;
+	/** Resolved active-branch message count (`context.messages.length`). */
 	messageCount: number;
 }
 
@@ -124,7 +131,7 @@ export function expandHome(p: string): string {
  * `sessions/<tool>/<runId>/*.jsonl`) are out of scope by design: the caller
  * passes their path (a subagent envelope reports it as `session=`).
  */
-export async function resolveSessionRef(ref: string, toolName: string): Promise<string> {
+export async function resolveSessionRef(ref: string): Promise<string> {
 	if (ref.includes("/") || ref.includes("\\") || ref.endsWith(".jsonl")) {
 		return path.resolve(expandHome(ref));
 	}
@@ -138,7 +145,7 @@ export async function resolveSessionRef(ref: string, toolName: string): Promise<
 	if (globalMatch) return globalMatch.path;
 
 	throw new Error(
-		`${toolName}: no session found for "${ref}". Session ids come from the id= field of read_session's envelope. ` +
+		`no session found for "${ref}". Session ids come from the id= field of read_session's envelope. ` +
 			"Id lookup only covers sessions under ~/.pi/agent/sessions/<project>/; for sessions outside that layout " +
 			"(e.g. subagent sessions), pass the .jsonl path instead.",
 	);
@@ -243,13 +250,12 @@ export function formatTranscript(
 
 /**
  * Read a session JSONL file, parse, migrate to the current version, and split
- * the header from the entry array. Shared by `read_session` and
- * `read_session_compaction`. Throws with a tool-prefixed message when the file
- * is unreadable.
+ * the header from the entry array. Shared by `read_session`,
+ * `read_session_compaction`, and `read_session_tool_result`. Throws when the
+ * file is unreadable.
  */
 export function loadSessionEntries(
 	rawPath: string,
-	toolName: string,
 ): { filePath: string; header: SessionHeader | undefined; entries: SessionEntry[] } {
 	const filePath = expandHome(rawPath);
 
@@ -257,7 +263,7 @@ export function loadSessionEntries(
 	try {
 		content = fs.readFileSync(filePath, "utf-8");
 	} catch (error) {
-		throw new Error(`${toolName}: cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
 	const parsed = parseSessionEntries(content);
@@ -339,16 +345,20 @@ export async function readSession(
 	session: string,
 	leafId: string | undefined,
 ): Promise<{ text: string; details: ReadSessionDetails }> {
-	const sessionPath = await resolveSessionRef(session, "read_session");
-	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath, "read_session");
+	const sessionPath = await resolveSessionRef(session);
+	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath);
 
 	const context = buildSessionContext(sessionEntries, leafId);
-	const annotations = alignAnnotations(buildContextEntries(sessionEntries, leafId), context.messages);
+	// The resolved active-branch entry list (post branch/compaction) — exactly the entries
+	// buildSessionContext projects into context.messages. Reported as entries= so it pairs
+	// with messages= on the same resolution instead of the raw on-disk total.
+	const contextEntries = buildContextEntries(sessionEntries, leafId);
+	const annotations = alignAnnotations(contextEntries, context.messages);
 	const envelopeParts = [
 		`session=${filePath}`,
 		header?.id ? `id=${header.id}` : undefined,
 		header?.cwd ? `cwd=${header.cwd}` : undefined,
-		`entries=${sessionEntries.length}`,
+		`entries=${contextEntries.length}`,
 		`messages=${context.messages.length}`,
 		`thinkingLevel=${context.thinkingLevel}`,
 		context.model?.provider && context.model?.modelId
@@ -361,6 +371,6 @@ export async function readSession(
 
 	return {
 		text,
-		details: { path: filePath, entryCount: sessionEntries.length, messageCount: context.messages.length },
+		details: { path: filePath, entryCount: contextEntries.length, messageCount: context.messages.length },
 	};
 }
