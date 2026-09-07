@@ -1,7 +1,7 @@
 /**
  * Subagent extension entry.
  *
- * Registers four native pi tools:
+ * Registers six native pi tools:
  *   - `finder`       : specialized code-search subagent (baked-in spec).
  *   - `oracle`       : specialized reasoning-advisor subagent (baked-in spec).
  *   - `task`         : inline, general-purpose subagent; config read per-call
@@ -11,6 +11,12 @@
  *                      pi process).
  *   - `read_session` : read-only viewer for pi session JSONL files (e.g. the
  *                      `session=` path a subagent envelope reports).
+ *   - `read_session_compaction` : drill into the original (pre-compaction)
+ *                      content a compaction entry replaced (the span between
+ *                      the previous compaction's kept boundary and its own).
+ *   - `read_session_tool_result` : drill into the full content of a specific
+ *                      tool result (the id= on a ## toolResult stub line in
+ *                      read_session / read_session_compaction output).
  *
  * The spawn/parse/envelope/render machinery + the standard execute body live
  * in the `Subagent` class (`subagent.ts`); specialized specs + description
@@ -27,6 +33,18 @@ import {
 	readSession,
 	type ReadSessionDetails,
 } from "./read-session.ts";
+import {
+	READ_SESSION_COMPACTION_DESCRIPTION,
+	ReadSessionCompactionParams,
+	readSessionCompaction,
+	type ReadSessionCompactionDetails,
+} from "./read-compaction.ts";
+import {
+	READ_TOOL_RESULT_DESCRIPTION,
+	ReadToolResultParams,
+	readSessionToolResult,
+	type ReadToolResultDetails,
+} from "./read-tool-result.ts";
 import {
 	FINDER_DESCRIPTION,
 	FINDER_SPEC,
@@ -157,7 +175,37 @@ export default function (pi: ExtensionAPI) {
 		parameters: ReadSessionParams,
 
 		async execute(_toolCallId, params): Promise<AgentToolResult<ReadSessionDetails>> {
-			const { text, details } = await readSession(params.path, params.leafId);
+			const { text, details } = await readSession(params.session, params.leafId);
+			return { content: [{ type: "text", text }], details };
+		},
+	});
+
+	// --- read_session_compaction: drill into the original content a compaction
+	// entry replaced. Same no-custom-rendering pattern as read_session: the
+	// harness's fallback renderer shows the returned text as-is.
+	pi.registerTool({
+		name: "read_session_compaction",
+		label: "Read Session Compaction",
+		description: READ_SESSION_COMPACTION_DESCRIPTION,
+		parameters: ReadSessionCompactionParams,
+
+		async execute(_toolCallId, params): Promise<AgentToolResult<ReadSessionCompactionDetails>> {
+			const { text, details } = await readSessionCompaction(params.session, params.entryId);
+			return { content: [{ type: "text", text }], details };
+		},
+	});
+
+	// --- read_session_tool_result: drill into the full content of a tool
+	// result (the id= on a ## toolResult stub line). Same no-custom-rendering
+	// pattern as the other session viewers.
+	pi.registerTool({
+		name: "read_session_tool_result",
+		label: "Read Session Tool Result",
+		description: READ_TOOL_RESULT_DESCRIPTION,
+		parameters: ReadToolResultParams,
+
+		async execute(_toolCallId, params): Promise<AgentToolResult<ReadToolResultDetails>> {
+			const { text, details } = await readSessionToolResult(params.session, params.entryId);
 			return { content: [{ type: "text", text }], details };
 		},
 	});
