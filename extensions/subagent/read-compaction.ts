@@ -1,58 +1,44 @@
 /**
- * read_session_compaction tool — drill into the original (pre-compaction)
- * content a specific compaction entry replaced.
+ * read_session_compaction tool — reconstruct the exact content a specific
+ * compaction entry's summary was derived from.
  *
- * Semantics mirror pi's repeated-compaction rule (official docs +
- * `prepareCompaction`): a compaction summarizes the span from the previous
- * compaction's kept boundary (`firstKeptEntryId`) up to its own
- * `firstKeptEntryId`. This tool renders exactly that span, raw:
+ * A compaction's summary is `update(previousSummary, newly-expired raw)`, so
+ * its input is two things: the previous compaction's summary S(n-1) and the
+ * raw messages that just stopped being recent. This tool returns both.
  *
- *   - start = `firstKeptEntryId` of the latest compaction entry that precedes
- *     the target on its parent chain (no earlier compaction → path start;
- *     dangling id → the entry right after that compaction, mirroring
- *     `prepareCompaction`'s boundaryStart fallback),
- *   - end (exclusive) = the target's `firstKeptEntryId` (dangling → the
- *     target's own position).
+ * Derivation (mirrors pi's repeated-compaction rule, #2608): resolve the live
+ * context as it was right before this compaction fired by calling
+ * `buildContextEntries(entries, target.parentId)` — the entry just before the
+ * compaction is the leaf. That drops the previous compaction's summarized
+ * prefix and hoists its summary to the front, yielding
+ * [S(n-1)] + [raw up to target.parent]. Then cut off everything at/after the
+ * target's `firstKeptEntryId` (its new retained tail, which it did not
+ * summarize). What remains is exactly what this compaction folded in.
  *
- * The span is rendered entry by entry with `sessionEntryToContextMessages`,
- * with compaction entries explicitly excluded — deliberately NOT re-run
- * through `buildSessionContext`: `sessionEntryToContextMessages` maps a
- * compaction entry to its compactionSummary message, and the span may contain
- * an absorbed previous compaction or an older one that survived inside a kept
- * range. Excluding them keeps the output pure original content with no
- * summary blocks.
- *
- * Partition property: adjacent compactions' spans tile the session history
- * without overlap; the union of all spans plus the current resolved
- * transcript is the complete history. One call covers one compaction
- * generation; no recursion needed. Output is untruncated (the span is the
- * requested raw content; re-reads of sessions collapse tool results via
- * formatTranscript, so size does not compound).
+ * The span is rendered whole through the same `formatTranscript` read_session
+ * uses: the previous compaction renders as its native `compactionSummary`
+ * block at the top, followed by the raw messages. This is why the
+ * intermediate summaries S(1)..S(n-1) are reachable here — each S(k) surfaces
+ * exactly once, as the compactionSummary block of compaction C_{k+1}. Output
+ * is untruncated (both the summary and the raw are the requested content).
  *
  * Abandoned-branch compactions are not discoverable via `read_session` (only
- * the active branch is resolved) but remain drillable here: the span walk
- * follows the target's own parent chain.
+ * the active branch is resolved) but remain drillable here: the resolution
+ * follows `target.parent`'s own parent chain.
  */
 
-import {
-	sessionEntryToContextMessages,
-	type CompactionEntry,
-	type SessionEntry,
-} from "@earendil-works/pi-coding-agent";
+import { buildContextEntries, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { alignAnnotations, formatTranscript, loadSessionEntries, resolveSessionRef } from "./read-session.ts";
 
 export const READ_SESSION_COMPACTION_DESCRIPTION =
-	"Read the original (pre-compaction) content that a specific compaction entry replaced. " +
-	"Pass a pi session (file path or session id, same rules as read_session) and a compaction " +
-	"entry id (from a compactionSummary block header in read_session output). Returns an envelope " +
-	"line (session id, counts, " +
-	"span=<firstIncludedId>..<firstKeptEntryId>) followed by the raw messages that compaction " +
-	"summarized: the span from the previous compaction's kept boundary up to this compaction's " +
-	"firstKeptEntryId, rendered without summary blocks (compaction entries inside the span are " +
-	"skipped). Adjacent compactions have disjoint spans, so drilling each compaction id recovers " +
-	"the full history. Output is not truncated: the span is the raw content, the whole point of " +
-	"this tool. Read-only.";
+	"Reconstruct the content a specific compaction's summary was derived from: the previous " +
+	"compaction summary plus the raw messages that compaction summarized. Pass a pi session (file " +
+	"path or session id, same rules as read_session) and a compaction entry id (from a compactionSummary " +
+	"block header in read_session output). Returns an envelope line (session id, counts, " +
+	"span=<firstRawId>..<firstKeptEntryId>) then the previous summary as a compactionSummary " +
+	"block, then the raw messages summarized. For the first compaction there is no previous " +
+	"summary, so only the raw is returned. Output is not truncated. Read-only.";
 
 export const ReadSessionCompactionParams = Type.Object({
 	session: Type.String({
@@ -67,8 +53,11 @@ export const ReadSessionCompactionParams = Type.Object({
 
 export interface ReadSessionCompactionDetails {
 	path: string;
+	/** Raw on-disk entry total (whole session file, before any resolution). */
 	entryCount: number;
+	/** Messages in the returned body: the previous-summary block(s) + the summarized raw. */
 	messageCount: number;
+	/** Entries in the cut span (previous compaction + summarized raw), before projection. */
 	spanEntryCount: number;
 }
 
@@ -97,50 +86,39 @@ export async function readSessionCompaction(
 		throw new Error(`read_session_compaction: entry "${entryId}" is a ${target.type} entry, not a compaction entry.`);
 	}
 
-	// Walk the target's parent chain — same semantics as the unexported
-	// buildSessionPath (index by id, follow parentId links up to the root,
-	// reverse). The target is the leaf of this walk. A dangling parentId ends
-	// the walk early, exactly like upstream.
-	const byId = new Map(sessionEntries.map((entry) => [entry.id, entry]));
-	const path: SessionEntry[] = [];
-	let current: SessionEntry | undefined = target;
-	while (current) {
-		path.push(current);
-		current = current.parentId ? byId.get(current.parentId) : undefined;
+	// Reconstruct the live context as it was right before this compaction
+	// fired: the entry just before the compaction (target.parentId) is the
+	// leaf. buildContextEntries drops the previous compaction's summarized
+	// prefix and hoists its summary to the front, giving
+	// [S(n-1)] + [raw up to target.parent] — the exact input this compaction's
+	// update consumed (the #2608 repeated-compaction rule lives upstream, so
+	// we inherit it). Guard the leaf: buildSessionPath silently falls back to
+	// the global latest entry for a falsy/unknown leafId, which would resolve
+	// the wrong branch.
+	if (!target.parentId) {
+		throw new Error(
+			`read_session_compaction: compaction entry "${target.id}" has no parent entry; cannot resolve the pre-compaction context.`,
+		);
 	}
-	path.reverse();
-	const targetIdx = path.length - 1;
+	const contextEntries = buildContextEntries(sessionEntries, target.parentId);
 
-	// End (exclusive): the target's firstKeptEntryId, falling back to the
-	// target's own position when the id dangles or points past the target.
-	const k2Idx = path.findIndex((entry) => entry.id === target.firstKeptEntryId);
-	const endIdx = k2Idx >= 0 && k2Idx <= targetIdx ? k2Idx : targetIdx;
+	// This compaction kept everything from firstKeptEntryId onward as its new
+	// retained tail; that tail is NOT part of what it summarized. Cut it off:
+	// keep strictly the entries before firstKeptEntryId (the previous summary +
+	// the newly-expired raw). Dangling firstKeptEntryId -> keep everything.
+	const cutIdx = contextEntries.findIndex((entry) => entry.id === target.firstKeptEntryId);
+	const span = cutIdx >= 0 ? contextEntries.slice(0, cutIdx) : contextEntries;
 
-	// Start: the kept boundary of the latest compaction entry before the target.
-	let prevComp: CompactionEntry | undefined;
-	for (let i = 0; i < targetIdx; i++) {
-		const entry = path[i];
-		if (entry.type === "compaction") prevComp = entry;
-	}
-	let startIdx = 0;
-	if (prevComp) {
-		const prevCompIdx = path.findIndex((entry) => entry.id === prevComp.id);
-		const boundaryIdx = path.findIndex((entry) => entry.id === prevComp.firstKeptEntryId);
-		// Dangling boundary → the entry right after that compaction (mirrors
-		// prepareCompaction's boundaryStart fallback). Both fallbacks clamp to
-		// endIdx so the span is never negative.
-		startIdx = boundaryIdx >= 0 && boundaryIdx <= endIdx ? boundaryIdx : prevCompIdx + 1;
-		if (startIdx > endIdx) startIdx = endIdx;
-	}
-
-	const span = path.slice(startIdx, endIdx);
-	const spanEntries = span.filter((entry) => entry.type !== "compaction");
-	const messages = spanEntries.flatMap(sessionEntryToContextMessages);
-
-	// Tool result stubs carry their entry ids in span output too (same zip as
-	// read_session; on any inconsistency annotations drop, rendering stays).
-	const spanText = formatTranscript(messages, alignAnnotations(spanEntries, messages));
+	// Render the whole span (previous summary + raw) with the same formatter
+	// read_session uses; the previous compaction renders as its native
+	// compactionSummary block at the top.
+	const messages = span.flatMap(sessionEntryToContextMessages);
+	const spanText = formatTranscript(messages, alignAnnotations(span, messages));
 	const body = spanText || "(no summarized content for this compaction)";
+
+	// The raw entry range this compaction covered, for the envelope span=.
+	// Skip the hoisted previous-summary block so the range spans raw entries.
+	const firstRaw = span.find((entry) => entry.type !== "compaction");
 
 	const envelopeParts = [
 		`session=${filePath}`,
@@ -148,7 +126,7 @@ export async function readSessionCompaction(
 		header?.cwd ? `cwd=${header.cwd}` : undefined,
 		`entries=${sessionEntries.length}`,
 		`messages=${messages.length}`,
-		`span=${path[startIdx]?.id ?? "?"}..${path[endIdx]?.id ?? "?"}`,
+		`span=${firstRaw?.id ?? "?"}..${target.firstKeptEntryId}`,
 	].filter((part): part is string => part !== undefined);
 
 	const text = `[${envelopeParts.join(" ")}]\n${body}`;

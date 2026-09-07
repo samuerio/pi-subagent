@@ -36,9 +36,9 @@ pi 扩展入口（通过 `package.json` 的 `"pi".extensions` 注册）。`sessi
 
 ### `extensions/subagent/read-compaction.ts`
 
-`read_session_compaction` tool：按 compaction entry id 钻取被该次压缩摘要掉的原文。span 语义与 pi 的 repeated-compaction 规则一致：从"路径上上一条 compaction 的 `firstKeptEntryId`"到"该 entry 自身的 `firstKeptEntryId`"之前的 parent 链子集，逐 entry 用 `sessionEntryToContextMessages` 原始渲染，显式跳过 span 内的 compaction entry（被吸收的更早压缩），输出纯原文、无 summary 块。envelope 追加 `span=<firstIncludedId>..<firstKeptEntryId>`。相邻 compaction 的 span 首尾相接不重叠（partition 性质）：全部 span 的并集 + 现行 transcript = 完整历史，单次调用覆盖一代压缩，无需递归。
+`read_session_compaction` tool：按 compaction entry id 重建"该次压缩的 summary 由什么加工而来"= 上一个 summary `S(n-1)` + 本次新淘汰的 raw。推导复用上游 `buildContextEntries(entries, target.parentId)`：以紧邻 compaction 前的 entry 为 leaf 取到触发前的 live context（上一条 compaction 的已摘要前缀被丢弃、其 summary 被 hoist 到最前，得到 `[S(n-1)] + [raw 到 target.parent]`），再裁掉 `>= target.firstKeptEntryId`（它新保留的 recent tail，未被摘要）；#2608 重复压缩规则在上游，直接继承。整段经与 `read_session` 同一 `formatTranscript` 渲染：上一个 compaction 渲染成顶部的原生 `compactionSummary` 块，随后是 raw——因此中间 summary `S(1)..S(n-1)` 在此可达，每个 `S(k)` 恰好作为 `C_{k+1}` 的 compactionSummary 块出现一次。envelope 追加 `span=<firstRawId>..<firstKeptEntryId>`（起点跳过顶部 summary 块、指向第一条 raw）。输出不截断（summary 与 raw 均为所求内容）。
 
-**Architecture Invariant:** 不经 `buildSessionContext` 重放——span 是从历史流中间切出的切片，不是某个 leaf 的上下文状态；`sessionEntryToContextMessages` 对 compaction entry 产出的是 summary 消息而非空，必须显式过滤。span 渲染同样传入 `alignAnnotations`，工具结果 stub 在 span 输出里也带 `id=`。
+**Architecture Invariant:** 必须经 `buildContextEntries(entries, target.parentId)` 重建"触发前一刻的 live context"（上一条 compaction 的已摘要前缀被丢弃、其 summary 被 hoist 到最前），再裁掉 `>= target.firstKeptEntryId` 的 retained tail；裁后前缀 = `[S(n-1)] + [newly-expired raw]`，即该次 `update` 的完整输入。必须 guard `target.parentId`：`buildSessionPath` 对 falsy/未知 leafId 会静默回退到全局最新 entry，取错分支。span 经与 `read_session` 同一 `formatTranscript` 整段渲染，上一个 compaction 落在顶部 `compactionSummary` 块（不再过滤）。中间 summary `S(1)..S(n-1)` 因此可达：每个 `S(k)` 恰好作为 `C_{k+1}` 的 compactionSummary 块出现一次。span 渲染同样传入 `alignAnnotations`，工具结果 stub 在输出里也带 `id=`。
 
 ### `extensions/subagent/read-tool-result.ts`
 
@@ -51,7 +51,7 @@ Inline 子代理的默认配置（model/thinking/tools/noSkills），全可选�
 
 ## Cross-Cutting Concerns
 
-- **Observability:** 每个子进程的 session 持久化到 `~/.pi/agent/sessions/<tool名>/<runId>/`；其绝对 JSONL 路径在 session 事件触发时即被实时展示，因此中途被 abort 的工作仍可被检查。本版本不支持 resume，session 路径仅用于事后审查；事后审查经 `read_session`（resolved transcript，compactionSummary 块与 toolResult stub 带 entry id）、`read_session_compaction`（按 id 钻取被压缩原文）与 `read_session_tool_result`（按 stub id 钻取工具结果全量内容）完成，三工具同样严格只读。
+- **Observability:** 每个子进程的 session 持久化到 `~/.pi/agent/sessions/<tool名>/<runId>/`；其绝对 JSONL 路径在 session 事件触发时即被实时展示，因此中途被 abort 的工作仍可被检查。本版本不支持 resume，session 路径仅用于事后审查；事后审查经 `read_session`（resolved transcript，compactionSummary 块与 toolResult stub 带 entry id）、`read_session_compaction`（按 id 重建该 summary 的 update 输入：上一个 summary + 新淘汰 raw）与 `read_session_tool_result`（按 stub id 钻取工具结果全量内容）完成，三工具同样严格只读。
 - **Fault tolerance:** abort 不会丢弃已完成的工作；被中断的子进程返回 `status=aborted`，session 路径保持可检查。
 - **Concurrency:** 每个 tool 一次调用只 spawn 一个子进程。并行扇出由主代理在同一 turn 发出多个 tool 调用实现，并发度由 pi harness 决定（harness 默认并发执行 sibling tool calls）。
 - **Nesting:** inline `task` 在其 `subagent.json` `tools` 白名单中列入 `finder`/`oracle` 后，子 pi 进程（加载同一套扩展）即可调用这些 tool，触发 grandchild pi 进程。grandchild session 写入对应 tool 名子目录，runId 含时间戳+随机，与父不冲突。本扩展不额外标注父子 session 关联（保持简单，事后审查靠 runId 时间戳对齐）。
