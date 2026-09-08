@@ -33,6 +33,9 @@
  * handles `read_session_compaction` needs to drill into the original content
  * a compaction replaced; tool result ids are the handles
  * `read_session_tool_result` needs to drill into a tool's full output.
+ * Tool calls and results also carry a shared truncated toolCallId key
+ * ([call_xxxxxxxx]) so parallel calls match to their results; it is derived
+ * from the message itself, not the entry zip.
  *
  * Shared helpers (`expandHome`, `loadSessionEntries`, `formatTranscript`)
  * are exported for `read-compaction.ts`, which renders
@@ -73,8 +76,9 @@ export const READ_SESSION_DESCRIPTION =
 	"transcript with compaction applied: user/assistant text, tool calls, error results, and " +
 	"compaction/branch summaries. compactionSummary block headers carry the compaction entry id " +
 	"(id=xxxx tokensBefore=N) and branchSummary headers carry fromId=; pass a compaction id to " +
-	"read_session_compaction to read the original content that compaction replaced. Tool results render as one-line stubs " +
-	"carrying their entry id (## toolResult:<name> (id=xxxx)); pass that id to read_session_tool_result to read the " +
+	"read_session_compaction to read the original content that compaction replaced. Tool calls and results carry a " +
+	"shared truncated toolCallId key ([call-xxxx]) so parallel calls match to their results; tool-result stubs also " +
+	"carry their entry id (## toolResult:<name> (id=xxxx)); pass that id to read_session_tool_result to read the " +
 	"full content. Read-only. " +
 	"Pass leafId to inspect a specific branch tip; omit it for the current leaf (the file's last " +
 	"entry).";
@@ -177,6 +181,18 @@ function formatToolCallArgs(args: Record<string, unknown>): string {
 }
 
 /**
+ * Display key linking a tool call to its result: the toolCallId, truncated
+ * to the `call_` prefix + first 8 hex (13 chars). Both the toolCall part
+ * `id` and the toolResult message `toolCallId` truncate identically, so
+ * parallel calls stay matchable. Collision-free within one session (a 50%
+ * prefix-collision chance would need ~100k calls).
+ */
+function shortToolCallId(id: string | undefined): string | undefined {
+	if (!id) return undefined;
+	return id.length > 13 ? id.slice(0, 13) : id;
+}
+
+/**
  * Format the resolved transcript. Dispatch on message role — NOT on session
  * entry type (entry types are projected away by buildSessionContext; see the
  * module docblock for the mapping).
@@ -200,7 +216,8 @@ export function formatTranscript(
 						const text = part.text.trim();
 						if (text) lines.push(text);
 					} else if (part.type === "toolCall") {
-						lines.push(`→ ${part.name}(${formatToolCallArgs(part.arguments)})`);
+						const cid = shortToolCallId(part.id);
+						lines.push(`→ ${cid ? `[${cid}] ` : ""}${part.name}(${formatToolCallArgs(part.arguments)})`);
 					}
 					// thinking parts are skipped
 				}
@@ -208,18 +225,21 @@ export function formatTranscript(
 				break;
 			}
 			case "toolResult": {
-				// Every result renders a one-line stub carrying its entry id —
-				// the drill handle for read_session_tool_result. Errors
-				// additionally keep a short preview so failures stay visible
-				// inline. No annotation (zip dropped) → no stub, as before.
+				// Every result renders a one-line stub: [call-key] links it back
+				// to the assistant tool call (so parallel calls match their
+				// results); id= is the session-entry drill handle for
+				// read_session_tool_result. Errors keep a short preview inline.
+				// No annotation (zip dropped) → no stub, as before.
 				const note = annotations.get(index);
+				const callKey = shortToolCallId(msg.toolCallId);
+				const cid = callKey ? `[${callKey}] ` : "";
 				if (msg.isError) {
 					const text = textOf(msg.content).trim();
 					blocks.push(
-						`## toolResult:${msg.toolName} (error${note ? `, ${note}` : ""})${text ? `\n${preview(text, TOOL_RESULT_ERROR_PREVIEW)}` : ""}`,
+						`## toolResult:${msg.toolName} ${cid}(error${note ? `, ${note}` : ""})${text ? `\n${preview(text, TOOL_RESULT_ERROR_PREVIEW)}` : ""}`,
 					);
 				} else if (note) {
-					blocks.push(`## toolResult:${msg.toolName} (${note})`);
+					blocks.push(`## toolResult:${msg.toolName} ${cid}(${note})`);
 				}
 				break;
 			}
