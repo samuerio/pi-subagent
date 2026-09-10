@@ -14,9 +14,13 @@
  *   - `read_session_compaction` : drill into the original (pre-compaction)
  *                      content a compaction entry replaced (the span between
  *                      the previous compaction's kept boundary and its own).
- *   - `read_session_tool_result` : drill into the full content of a specific
- *                      tool result (the id= on a ## toolResult stub line in
+ *   - `read_session_entry` : drill into the full content of a specific
+ *                      entry (the id= on a ## toolResult stub line, a →
+ *                      tool-call line, or a ## bash block header in
  *                      read_session / read_session_compaction output).
+ *                      Custom TUI rendering: renderCall highlights the
+ *                      drill id (the entry kind is only known after
+ *                      execute, so renderResult adds a kind summary line).
  *
  * The spawn/parse/envelope/render machinery + the standard execute body live
  * in the `Subagent` class (`subagent.ts`); specialized specs + description
@@ -39,12 +43,9 @@ import {
 	readSessionCompaction,
 	type ReadSessionCompactionDetails,
 } from "./read-compaction.ts";
-import {
-	READ_TOOL_RESULT_DESCRIPTION,
-	ReadToolResultParams,
-	readSessionToolResult,
-	type ReadToolResultDetails,
-} from "./read-tool-result.ts";
+import { READ_ENTRY_DESCRIPTION, ReadEntryParams, readSessionEntry, type ReadEntryDetails } from "./read-entry.ts";
+import { shortToolCallId } from "./read-session.ts";
+import { Text } from "@earendil-works/pi-tui";
 import {
 	FINDER_DESCRIPTION,
 	FINDER_SPEC,
@@ -195,18 +196,63 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- read_session_tool_result: drill into the full content of a tool
-	// result (the id= on a ## toolResult stub line). Same no-custom-rendering
+	// --- read_session_entry: drill into the full content of a specific entry
+	// (tool result / tool call arguments / bash output — the id= on the
+	// matching stub in read_session output). Same no-custom-rendering
 	// pattern as the other session viewers.
 	pi.registerTool({
-		name: "read_session_tool_result",
-		label: "Read Session Tool Result",
-		description: READ_TOOL_RESULT_DESCRIPTION,
-		parameters: ReadToolResultParams,
+		name: "read_session_entry",
+		label: "Read Session Entry",
+		description: READ_ENTRY_DESCRIPTION,
+		parameters: ReadEntryParams,
 
-		async execute(_toolCallId, params): Promise<AgentToolResult<ReadToolResultDetails>> {
-			const { text, details } = await readSessionToolResult(params.session, params.entryId);
+		async execute(_toolCallId, params): Promise<AgentToolResult<ReadEntryDetails>> {
+			const { text, details } = await readSessionEntry(params.session, params.entryId);
 			return { content: [{ type: "text", text }], details };
+		},
+
+		// renderCall fires before execute: only session + entryId are known,
+		// so highlight just the drill id (the thing the stubs reference). The
+		// session file is omitted: drills immediately follow a read_session
+		// call, so the session context is implied. The resolved kind appears
+		// in renderResult instead.
+		renderCall(args, theme, context) {
+			const entryId = typeof args.entryId === "string" ? args.entryId : "";
+			const shortId = entryId ? entryId.slice(0, 8) : "?";
+			let text = theme.fg("toolTitle", theme.bold("read_session_entry ")) + theme.fg("muted", shortId);
+			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			component.setText(text);
+			return component;
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const d = result.details as ReadEntryDetails | undefined;
+			const content = result.content
+				.map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+				.join("");
+			// Throw path: createErrorToolResult wipes details to {}. Fall back
+			// to the raw message, dyed error-colored (no kind to show).
+			if (!d?.kind) {
+				return new Text(context.isError ? theme.fg("error", content) : content, 0, 0);
+			}
+			let summary: string;
+			if (d.kind === "toolResult") {
+				const callId = d.callId ? shortToolCallId(d.callId) : "";
+				summary = `toolResult ${d.tool ?? ""}${callId ? ` [${callId}]` : ""}${d.isError ? " (error)" : ""}`;
+			} else if (d.kind === "bashExecution") {
+				summary = `bash (exit=${d.exitCode ?? "?"}) $ ${d.command ?? ""}`;
+			} else {
+				summary = `${d.calls ?? "?"} tool call${d.calls === 1 ? "" : "s"}`;
+			}
+			const header = theme.fg(d.isError ? "error" : "muted", `─── ${summary} ───`);
+			// Collapsed: header + a few content lines. Expanded: full content.
+			if (!expanded) {
+				const lines = content.split("\n");
+				const shown = lines.slice(0, 8).join("\n");
+				const text = `${header}\n${shown}${lines.length > 8 ? `\n${theme.fg("dim", `… ${lines.length - 8} more lines (expand to view)`)}` : ""}`;
+				return new Text(text, 0, 0);
+			}
+			return new Text(`${header}\n${content}`, 0, 0);
 		},
 	});
 }

@@ -18,24 +18,27 @@
  *
  * `ctx.messages` elements are AgentMessages dispatched by role. Session
  * entry types are projected by `buildSessionContext`:
- *   message("user"/"assistant"/"toolResult") → same roles,
+ *   message("user"/"assistant"/"toolResult"/"bashExecution") → same roles,
  *   custom_message → role "custom", compaction → "compactionSummary",
- *   branch_summary → "branchSummary", `!` commands → "bashExecution".
+ *   branch_summary → "branchSummary". (`!` commands are persisted as plain
+ *   message entries with role "bashExecution" by recordBashResult, not as a
+ *   dedicated entry type.)
  * Other entry types (custom, label, session_info, ...) do not participate
  * in context and are not rendered.
  *
- * Compaction/branch entry ids are re-attached to the rendered output: every
- * compactionSummary block header carries `id=` + `tokensBefore=` and every
- * branchSummary header carries `fromId=`. The ids are recovered by zipping
+ * Entry ids are re-attached to the rendered output — the drill handles the
+ * other read tools need: compactionSummary block headers carry `id=` +
+ * `tokensBefore=` (read_session_compaction drills into the original content
+ * the compaction replaced); toolResult stubs and bash (`!` command) block
+ * headers carry `id=` (read_session_entry drills into the full result /
+ * full output); assistant toolCall lines carry `id=` (read_session_entry
+ * drills into the calls' full arguments). The ids are recovered by zipping
  * the resolved message list against the resolved entry list
  * (`buildContextEntries` + `sessionEntryToContextMessages` — the same
- * projection `buildSessionContext` uses, so alignment is exact). They are the
- * handles `read_session_compaction` needs to drill into the original content
- * a compaction replaced; tool result ids are the handles
- * `read_session_tool_result` needs to drill into a tool's full output.
- * Tool calls and results also carry a shared truncated toolCallId key
- * ([call_xxxxxxxx]) so parallel calls match to their results; it is derived
- * from the message itself, not the entry zip.
+ * projection `buildSessionContext` uses, so alignment is exact). Tool calls
+ * and results also carry a shared truncated toolCallId key ([call_xxxxxxxx])
+ * so parallel calls match to their results; it is derived from the message
+ * itself, not the entry zip.
  *
  * Shared helpers (`expandHome`, `loadSessionEntries`, `formatTranscript`)
  * are exported for `read-compaction.ts`, which renders
@@ -77,9 +80,10 @@ export const READ_SESSION_DESCRIPTION =
 	"compaction/branch summaries. compactionSummary block headers carry the compaction entry id " +
 	"(id=xxxx tokensBefore=N) and branchSummary headers carry fromId=; pass a compaction id to " +
 	"read_session_compaction to read the original content that compaction replaced. Tool calls and results carry a " +
-	"shared truncated toolCallId key ([call-xxxx]) so parallel calls match to their results; tool-result stubs also " +
-	"carry their entry id (## toolResult:<name> (id=xxxx)); pass that id to read_session_tool_result to read the " +
-	"full content. Read-only. " +
+	"shared truncated toolCallId key ([call-xxxx]) so parallel calls match to their results. Entry ids are the drill " +
+	"handles for read_session_entry: toolResult stubs (## toolResult:<name> (id=xxxx)) → full result content, " +
+	"toolCall lines (→ [call-xxxx] (id=xxxx) name(args)) → full call arguments, bash blocks (## bash (exit=N, id=xxxx)) → full " +
+	"command output. Read-only. " +
 	"Pass leafId to inspect a specific branch tip; omit it for the current leaf (the file's last " +
 	"entry).";
 
@@ -187,7 +191,7 @@ function formatToolCallArgs(args: Record<string, unknown>): string {
  * parallel calls stay matchable. Collision-free within one session (a 50%
  * prefix-collision chance would need ~100k calls).
  */
-function shortToolCallId(id: string | undefined): string | undefined {
+export function shortToolCallId(id: string | undefined): string | undefined {
 	if (!id) return undefined;
 	return id.length > 13 ? id.slice(0, 13) : id;
 }
@@ -210,6 +214,12 @@ export function formatTranscript(
 				break;
 			}
 			case "assistant": {
+				// Entries carrying toolCall parts are annotated with id= (the
+				// drill handle for the calls' full arguments via
+				// read_session_entry); the id is stamped on each `→` line,
+				// right after the [call_xxx] key (before the long args blob).
+				const note = annotations.get(index);
+				const idTag = note ? `(${note})` : "";
 				const lines: string[] = [];
 				for (const part of msg.content) {
 					if (part.type === "text") {
@@ -217,7 +227,8 @@ export function formatTranscript(
 						if (text) lines.push(text);
 					} else if (part.type === "toolCall") {
 						const cid = shortToolCallId(part.id);
-						lines.push(`→ ${cid ? `[${cid}] ` : ""}${part.name}(${formatToolCallArgs(part.arguments)})`);
+						const head = ["→", cid ? `[${cid}]` : undefined, idTag, part.name].filter(Boolean).join(" ");
+						lines.push(`${head}(${formatToolCallArgs(part.arguments)})`);
 					}
 					// thinking parts are skipped
 				}
@@ -228,7 +239,7 @@ export function formatTranscript(
 				// Every result renders a one-line stub: [call-key] links it back
 				// to the assistant tool call (so parallel calls match their
 				// results); id= is the session-entry drill handle for
-				// read_session_tool_result. Errors keep a short preview inline.
+				// read_session_entry. Errors keep a short preview inline.
 				// No annotation (zip dropped) → no stub, as before.
 				const note = annotations.get(index);
 				const callKey = shortToolCallId(msg.toolCallId);
@@ -249,8 +260,12 @@ export function formatTranscript(
 				break;
 			}
 			case "bashExecution": {
+				// id= is the drill handle for the full output via read_session_entry.
+				const note = annotations.get(index);
 				const output = msg.output ? preview(msg.output, BASH_OUTPUT_PREVIEW) : "";
-				blocks.push(`## bash (exit=${msg.exitCode ?? "?"})\n$ ${msg.command}${output ? `\n${output}` : ""}`);
+				blocks.push(
+					`## bash (exit=${msg.exitCode ?? "?"}${note ? `, ${note}` : ""})\n$ ${msg.command}${output ? `\n${output}` : ""}`,
+				);
 				break;
 			}
 			case "compactionSummary": {
@@ -271,7 +286,7 @@ export function formatTranscript(
 /**
  * Read a session JSONL file, parse, migrate to the current version, and split
  * the header from the entry array. Shared by `read_session`,
- * `read_session_compaction`, and `read_session_tool_result`. Throws when the
+ * `read_session_compaction`, and `read_session_entry`. Throws when the
  * file is unreadable.
  */
 export function loadSessionEntries(
@@ -308,8 +323,10 @@ export function loadSessionEntries(
  * branches and duplicate texts.
  *
  * compactionSummary messages get `id=` + `tokensBefore=`; branchSummary
- * messages get `fromId=`; toolResult messages get `id=` (the drill handle
- * for read_session_tool_result, rendered as a one-line stub). Everything
+ * messages get `fromId=`; toolResult and bashExecution (`!` command) messages
+ * get `id=` (the drill handles for read_session_entry, rendered on the stub /
+ * block header); assistant messages with toolCall parts get `id=` (stamped on
+ * each `→` line, the drill handle for the calls' full arguments). Everything
  * else is only consistency-checked.
  * Purely defensive against upstream projection changes: on ANY inconsistency
  * (count or entry-type/message-role pair) drop all annotations rather than
@@ -334,10 +351,20 @@ export function alignAnnotations(
 					note = `fromId=${entry.fromId}`;
 					break;
 				case "message":
-					if (msg.role !== "user" && msg.role !== "assistant" && msg.role !== "toolResult") return new Map();
-					// Tool results carry their entry id: the drill handle for
-					// read_session_tool_result.
-					if (msg.role === "toolResult") note = `id=${entry.id}`;
+					// user: fully rendered, no drill needed. assistant: annotated when
+					// it carries toolCall parts (the drill handle for the call's full
+					// arguments via read_session_entry). toolResult and bashExecution
+					// (`!` commands, persisted as plain message entries by
+					// recordBashResult) always carry the entry id: the drill handles
+					// for the full result / full output via read_session_entry.
+					if (msg.role === "assistant") {
+						if (msg.content.some((part) => part.type === "toolCall")) note = `id=${entry.id}`;
+					} else if (msg.role === "toolResult" || msg.role === "bashExecution") {
+						note = `id=${entry.id}`;
+					} else if (msg.role !== "user") {
+						// Unknown role: projection semantics changed, zip cannot be trusted.
+						return new Map();
+					}
 					break;
 				case "custom_message":
 					if (msg.role !== "custom") return new Map();
