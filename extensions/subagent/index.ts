@@ -10,10 +10,16 @@
  *                      and call them from inside its child context (grandchild
  *                      pi process).
  *   - `read_session` : read-only viewer for pi session JSONL files (e.g. the
- *                      `session=` path a subagent envelope reports).
+ *                      `session=` path a subagent envelope reports). Custom
+ *                      TUI rendering: renderCall shows the session ref (path
+ *                      with $HOME collapsed to ~) + short leaf marker; plain
+ *                      renderResult styling via renderTranscriptResult.
  *   - `read_session_compaction` : drill into the original (pre-compaction)
  *                      content a compaction entry replaced (the span between
  *                      the previous compaction's kept boundary and its own).
+ *                      Custom TUI rendering: renderDrillCall highlights the
+ *                      compaction id (shared with read_session_entry); plain
+ *                      renderResult styling via renderTranscriptResult.
  *   - `read_session_entry` : drill into the full content of a specific
  *                      entry (the id= on a ## toolResult stub line, a →
  *                      tool-call line, or a ## bash block header in
@@ -28,6 +34,7 @@
  */
 
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
@@ -147,17 +154,55 @@ function renderSessionResult(styled: string, expanded: boolean, theme: any) {
 }
 
 /**
- * Plain-text result renderer for `read_session` / `read_session_compaction`
- * (no details to specialize on, transcript text as-is). Error results dye
- * the whole message error-colored with no leading blank, matching
- * read_session_entry's throw path.
+ * Display-only path shortening: collapse the $HOME prefix to `~`. Purely
+ * cosmetic (expandHome reverses it); used in renderCall text.
+ */
+function shortenPath(p: string): string {
+	const home = homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+/**
+ * Drill-call line builder shared by all three session tools' renderCall:
+ * bold toolTitle + muted argument summary, reusing the component slot the
+ * harness already allocated.
+ */
+function drillCallComponent(theme: any, context: any, title: string, muted: string) {
+	const text = theme.fg("toolTitle", theme.bold(`${title} `)) + theme.fg("muted", muted);
+	const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+	component.setText(text);
+	return component;
+}
+
+/**
+ * Shared renderCall for the two drill tools (`read_session_compaction`,
+ * `read_session_entry`): fires before execute, when only session + entryId
+ * are known, so highlight just the drill id (the thing the stubs in
+ * read_session output reference). The session file is omitted: drills
+ * immediately follow a read_session call, so the session context is
+ * implied.
+ */
+function renderDrillCall(toolName: string, args: Record<string, unknown>, theme: any, context: any) {
+	const entryId = typeof args.entryId === "string" ? args.entryId : "";
+	const shortId = entryId ? entryId.slice(0, 8) : "?";
+	return drillCallComponent(theme, context, toolName, shortId);
+}
+
+/**
+ * Plain-text result renderer for `read_session` / `read_session_compaction`.
+ * Styling matches read_session_entry exactly: per-line toolOutput coloring
+ * (transcript has no `## details` marker lines, so the dim special case
+ * doesn't apply), separator blank line + collapsed preview from the shared
+ * helper. Error results dye the whole message error-colored with no
+ * leading blank, matching read_session_entry's throw path.
  */
 function renderTranscriptResult(result: any, opts: { expanded: boolean }, theme: any, context: any) {
 	const content = result.content
 		.map((part: any) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
 		.join("");
 	if (context.isError) return new Text(theme.fg("error", content), 0, 0);
-	return renderSessionResult(content, opts.expanded, theme);
+	const styled = content.split("\n").map((line) => theme.fg("toolOutput", line)).join("\n");
+	return renderSessionResult(styled, opts.expanded, theme);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -232,6 +277,17 @@ export default function (pi: ExtensionAPI) {
 		description: READ_SESSION_DESCRIPTION,
 		parameters: ReadSessionParams,
 
+		// renderCall: bold title + muted session ref (path with $HOME collapsed
+		// to ~; id form shown as passed so it stays copyable into a drill
+		// tool) plus a short leaf marker when leafId is set.
+		renderCall(args, theme, context) {
+			const session = typeof args.session === "string" ? args.session : "";
+			const leafId = typeof args.leafId === "string" ? args.leafId : "";
+			const muted = [session ? shortenPath(session) : "?", leafId ? `leaf=${leafId.slice(0, 8)}` : ""]
+				.filter(Boolean)
+				.join(" ");
+			return drillCallComponent(theme, context, "read_session", muted);
+		},
 		async execute(_toolCallId, params): Promise<AgentToolResult<ReadSessionDetails>> {
 			const { text, details } = await readSession(params.session, params.leafId);
 			return { content: [{ type: "text", text }], details };
@@ -247,6 +303,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Read Session Compaction",
 		description: READ_SESSION_COMPACTION_DESCRIPTION,
 		parameters: ReadSessionCompactionParams,
+		renderCall: (args, theme, context) => renderDrillCall("read_session_compaction", args, theme, context),
 
 		async execute(_toolCallId, params): Promise<AgentToolResult<ReadSessionCompactionDetails>> {
 			const { text, details } = await readSessionCompaction(params.session, params.entryId);
@@ -270,19 +327,7 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text }], details };
 		},
 
-		// renderCall fires before execute: only session + entryId are known,
-		// so highlight just the drill id (the thing the stubs reference). The
-		// session file is omitted: drills immediately follow a read_session
-		// call, so the session context is implied. The resolved kind appears
-		// in renderResult instead.
-		renderCall(args, theme, context) {
-			const entryId = typeof args.entryId === "string" ? args.entryId : "";
-			const shortId = entryId ? entryId.slice(0, 8) : "?";
-			let text = theme.fg("toolTitle", theme.bold("read_session_entry ")) + theme.fg("muted", shortId);
-			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			component.setText(text);
-			return component;
-		},
+		renderCall: (args, theme, context) => renderDrillCall("read_session_entry", args, theme, context),
 
 		renderResult(result, { expanded }, theme, context) {
 			const d = result.details as ReadEntryDetails | undefined;
