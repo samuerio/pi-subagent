@@ -1,6 +1,15 @@
 /**
- * read_session tool — read-only viewer for pi session JSONL files.
+ * Session review tools — three read-only tools over pi session JSONL files,
+ * kept in one module at this package size (no separate read-compaction /
+ * read-entry files): the shared parse/resolve/format helpers below serve all
+ * three, and the stub-header formats are a contract between the tools, so
+ * they are easiest to keep in sync side by side. Sections:
  *
+ *   1. read_session           — resolved transcript viewer.
+ *   2. read_session_compaction — compaction span reconstruction.
+ *   3. read_session_entry      — single-entry drill-down.
+ *
+ * ─ read_session ─
  * Given a session reference (file path or session id — pi CLI's
  * `--session <path|id>` semantics, see `resolveSessionRef`), returns an
  * envelope line plus the resolved
@@ -14,7 +23,7 @@
  * migration may rewrite the file. The only SessionManager surface here is the
  * static read-only metadata lookup `list`/`listAll` inside
  * `resolveSessionRef` (session id → path, mirroring the CLI's
- * `--session <path|id>`); this tool is strictly read-only.
+ * `--session <path|id>`); every tool in this module is strictly read-only.
  *
  * `ctx.messages` elements are AgentMessages dispatched by role. Session
  * entry types are projected by `buildSessionContext`:
@@ -27,7 +36,7 @@
  * in context and are not rendered.
  *
  * Entry ids are re-attached to the rendered output — the drill handles the
- * other read tools need: compactionSummary block headers carry `id=` +
+ * other two tools need: compactionSummary block headers carry `id=` +
  * `tokensBefore=` (read_session_compaction drills into the original content
  * the compaction replaced); toolResult stubs and bash (`!` command) block
  * headers carry `id=` (read_session_entry drills into the full result /
@@ -40,11 +49,17 @@
  * so parallel calls match to their results; it is derived from the message
  * itself, not the entry zip.
  *
- * Shared helpers (`expandHome`, `loadSessionEntries`, `formatTranscript`)
- * are exported for `read-compaction.ts`, which renders
- * the pre-compaction span of a specific compaction entry. No separate
- * session-io module at this package size (see
- * .pi/spec/20260906-122510-read-session-compaction/plan.md).
+ * ─ read_session_compaction ─
+ * Reconstructs the exact content a specific compaction entry's summary was
+ * derived from (its full docblock sits on the section divider below). The
+ * span is rendered through the same `formatTranscript` read_session uses,
+ * which is why the intermediate summaries S(1)..S(n-1) are reachable there.
+ *
+ * ─ read_session_entry ─
+ * Drills into the full content behind a read_session stub (its full docblock
+ * sits on the section divider below). Notably, subagent tool results carry
+ * their full output in `details`, so this tool is the model-side recovery
+ * path for that promise.
  */
 
 import * as fs from "node:fs";
@@ -68,15 +83,20 @@ const TOOL_CALL_ARGS_PREVIEW = 120;
 const TOOL_RESULT_ERROR_PREVIEW = 300;
 const BASH_OUTPUT_PREVIEW = 300;
 
+// ============================================================================
+// Section 1: read_session
+// ============================================================================
+
 export const READ_SESSION_DESCRIPTION =
 	"Read a pi session JSONL file and return its resolved transcript. Pass a session file path (~ " +
 	"expands) or a session id (pi --session semantics: exact id first, then prefix match — current " +
 	"project tier before global, most recently modified wins on prefix ambiguity). Id lookup only " +
 	"covers sessions under ~/.pi/agent/sessions/<project>/; sessions outside that layout (e.g. " +
 	"subagent sessions) are only reachable by path, which a subagent envelope reports as session=. " +
-	"Returns an envelope line " +
-	"(cwd, entry/message counts, thinking level, model) followed by the active-branch " +
+	"Returns the active-branch " +
 	"transcript with compaction applied: user/assistant text, tool calls, error results, and " +
+	"compaction/branch summaries, plus a trailing envelope line " +
+	"(cwd, entry/message counts, thinking level, model) as a footnote. " +
 	"compaction/branch summaries. entries= counts context entries while messages= counts rendered " +
 	"messages; state-change entries (model_change, thinking_level_change) project to no messages, " +
 	"so entries may exceed messages. compactionSummary block headers carry the compaction entry id " +
@@ -119,7 +139,7 @@ export interface ReadSessionDetails {
 }
 
 /** Expand a leading `~` to the home directory. */
-export function expandHome(p: string): string {
+function expandHome(p: string): string {
 	if (p === "~") return os.homedir();
 	if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
 	return p;
@@ -144,7 +164,7 @@ export function expandHome(p: string): string {
  * `sessions/<tool>/<runId>/*.jsonl`) are out of scope by design: the caller
  * passes their path (a subagent envelope reports it as `session=`).
  */
-export async function resolveSessionRef(ref: string): Promise<string> {
+async function resolveSessionRef(ref: string): Promise<string> {
 	if (ref.includes("/") || ref.includes("\\") || ref.endsWith(".jsonl")) {
 		return path.resolve(expandHome(ref));
 	}
@@ -165,7 +185,7 @@ export async function resolveSessionRef(ref: string): Promise<string> {
 }
 
 /** Concatenate the text parts of a message content (string or parts array). */
-export function textOf(content: string | Array<{ type: string; text?: string }>): string {
+function textOf(content: string | Array<{ type: string; text?: string }>): string {
 	if (typeof content === "string") return content;
 	return content
 		.filter((part) => part.type === "text" && typeof part.text === "string")
@@ -206,7 +226,7 @@ function formatToolCallArgs(args: Record<string, unknown>): string {
  * parallel calls stay matchable. Collision-free within one session (a 50%
  * prefix-collision chance would need ~100k calls).
  */
-export function shortToolCallId(id: string | undefined): string | undefined {
+function shortToolCallId(id: string | undefined): string | undefined {
 	if (!id) return undefined;
 	return id.length > 13 ? id.slice(0, 13) : id;
 }
@@ -216,7 +236,7 @@ export function shortToolCallId(id: string | undefined): string | undefined {
  * entry type (entry types are projected away by buildSessionContext; see the
  * module docblock for the mapping).
  */
-export function formatTranscript(
+function formatTranscript(
 	messages: readonly AgentMessage[],
 	annotations: ReadonlyMap<number, string> = new Map(),
 ): string {
@@ -319,7 +339,7 @@ export function formatTranscript(
  * `read_session_compaction`, and `read_session_entry`. Throws when the
  * file is unreadable.
  */
-export function loadSessionEntries(
+function loadSessionEntries(
 	rawPath: string,
 ): { filePath: string; header: SessionHeader | undefined; entries: SessionEntry[] } {
 	const filePath = expandHome(rawPath);
@@ -362,7 +382,7 @@ export function loadSessionEntries(
  * (count or entry-type/message-role pair) drop all annotations rather than
  * risk stamping a wrong id.
  */
-export function alignAnnotations(
+function alignAnnotations(
 	entries: readonly SessionEntry[],
 	messages: readonly AgentMessage[],
 ): ReadonlyMap<number, string> {
@@ -413,8 +433,8 @@ export function alignAnnotations(
 }
 
 /**
- * Parse, migrate, and resolve a session file, then format the envelope +
- * transcript. `session` is a file path or a session id (see
+ * Parse, migrate, and resolve a session file, then format the transcript +
+ * tail envelope. `session` is a file path or a session id (see
  * `resolveSessionRef`). Throws with a descriptive message when the reference
  * does not resolve or the file is unreadable.
  */
@@ -445,10 +465,370 @@ export async function readSession(
 	].filter((part): part is string => part !== undefined);
 
 	const transcript = formatTranscript(context.messages, annotations);
-	const text = `[${envelopeParts.join(" ")}]\n${transcript || "(no messages)"}`;
+	// Envelope is a tail footnote, not a header: it is provenance metadata
+	// (file, counts, model), while the collapsed TUI preview shows the first
+	// visual lines — those should be transcript content, not metadata. One
+	// blank line separates body and footnote.
+	const text = `${transcript || "(no messages)"}\n\n[${envelopeParts.join(" ")}]`;
 
 	return {
 		text,
 		details: { path: filePath, entryCount: contextEntries.length, messageCount: context.messages.length },
 	};
+}
+
+// ============================================================================
+// Section 2: read_session_compaction
+// ============================================================================
+
+/**
+ * Reconstruct the exact content a specific compaction entry's summary was
+ * derived from.
+ *
+ * A compaction's summary is `update(previousSummary, newly-expired raw)`, so
+ * its input is two things: the previous compaction's summary S(n-1) and the
+ * raw messages that just stopped being recent. This tool returns both.
+ *
+ * Derivation (mirrors pi's repeated-compaction rule, #2608): resolve the live
+ * context as it was right before this compaction fired by calling
+ * `buildContextEntries(entries, target.parentId)` — the entry just before the
+ * compaction is the leaf. That drops the previous compaction's summarized
+ * prefix and hoists its summary to the front, yielding
+ * [S(n-1)] + [raw up to target.parent]. Then cut off everything at/after the
+ * target's `firstKeptEntryId` (its new retained tail, which it did not
+ * summarize). What remains is exactly what this compaction folded in.
+ *
+ * The span is rendered whole through the same `formatTranscript` read_session
+ * uses: the previous compaction renders as its native `compactionSummary`
+ * block at the top, followed by the raw messages. This is why the
+ * intermediate summaries S(1)..S(n-1) are reachable here — each S(k) surfaces
+ * exactly once, as the compactionSummary block of compaction C_{k+1}. Output
+ * is untruncated (both the summary and the raw are the requested content).
+ *
+ * Abandoned-branch compactions are not discoverable via `read_session` (only
+ * the active branch is resolved) but remain drillable here: the resolution
+ * follows `target.parent`'s own parent chain.
+ */
+
+export const READ_SESSION_COMPACTION_DESCRIPTION =
+	"Reconstruct the content a specific compaction's summary was derived from: the previous " +
+	"compaction summary plus the raw messages that compaction summarized. Pass a pi session (file " +
+	"path or session id, same rules as read_session) and a compaction entry id (from a compactionSummary " +
+	"block header in read_session output). Returns the previous summary as a compactionSummary " +
+	"block, then the raw messages summarized, plus a trailing envelope line (counts, " +
+	"span=<firstRawId>..<firstKeptEntryId>). For the first compaction there is no previous " +
+	"summary, so only the raw is returned. Output is not truncated. Read-only.";
+
+export const ReadSessionCompactionParams = Type.Object({
+	session: Type.String({
+		description:
+			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix).",
+	}),
+	entryId: Type.String({
+		description:
+			"Compaction entry id to drill into. Ids are listed on compactionSummary block headers in read_session output (id=xxxx tokensBefore=N).",
+	}),
+});
+
+export interface ReadSessionCompactionDetails {
+	path: string;
+	/** Raw on-disk entry total (whole session file, before any resolution). */
+	entryCount: number;
+	/** Messages in the returned body: the previous-summary block(s) + the summarized raw. */
+	messageCount: number;
+	/** Entries in the cut span (previous compaction + summarized raw), before projection. */
+	spanEntryCount: number;
+}
+
+/**
+ * Locate the target compaction entry, slice its summarized span off the
+ * parent-chain path, render the span raw, and wrap it in an envelope.
+ * `session` is a file path or a session id (see `resolveSessionRef`). Throws
+ * with a descriptive message for unresolvable session references, unknown
+ * ids, non-compaction ids, and unreadable files.
+ */
+export async function readSessionCompaction(
+	session: string,
+	entryId: string,
+): Promise<{ text: string; details: ReadSessionCompactionDetails }> {
+	const sessionPath = await resolveSessionRef(session);
+	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath);
+
+	const target = sessionEntries.find((entry) => entry.id === entryId);
+	if (!target) {
+		throw new Error(
+			`read_session_compaction: no entry with id "${entryId}" in ${filePath} (${sessionEntries.length} entries). ` +
+				"Compaction ids are listed on compactionSummary block headers in read_session output.",
+		);
+	}
+	if (target.type !== "compaction") {
+		throw new Error(`read_session_compaction: entry "${entryId}" is a ${target.type} entry, not a compaction entry.`);
+	}
+
+	// Reconstruct the live context as it was right before this compaction
+	// fired: the entry just before the compaction (target.parentId) is the
+	// leaf. buildContextEntries drops the previous compaction's summarized
+	// prefix and hoists its summary to the front, giving
+	// [S(n-1)] + [raw up to target.parent] — the exact input this compaction's
+	// update consumed (the #2608 repeated-compaction rule lives upstream, so
+	// we inherit it). Guard the leaf: buildSessionPath silently falls back to
+	// the global latest entry for a falsy/unknown leafId, which would resolve
+	// the wrong branch.
+	if (!target.parentId) {
+		throw new Error(
+			`read_session_compaction: compaction entry "${target.id}" has no parent entry; cannot resolve the pre-compaction context.`,
+		);
+	}
+	const contextEntries = buildContextEntries(sessionEntries, target.parentId);
+
+	// This compaction kept everything from firstKeptEntryId onward as its new
+	// retained tail; that tail is NOT part of what it summarized. Cut it off:
+	// keep strictly the entries before firstKeptEntryId (the previous summary +
+	// the newly-expired raw). Dangling firstKeptEntryId -> keep everything.
+	const cutIdx = contextEntries.findIndex((entry) => entry.id === target.firstKeptEntryId);
+	const span = cutIdx >= 0 ? contextEntries.slice(0, cutIdx) : contextEntries;
+
+	// Render the whole span (previous summary + raw) with the same formatter
+	// read_session uses; the previous compaction renders as its native
+	// compactionSummary block at the top.
+	const messages = span.flatMap(sessionEntryToContextMessages);
+	const spanText = formatTranscript(messages, alignAnnotations(span, messages));
+	const body = spanText || "(no summarized content for this compaction)";
+
+	// The raw entry range this compaction covered, for the envelope span=.
+	// Skip the hoisted previous-summary block so the range spans raw entries.
+	const firstRaw = span.find((entry) => entry.type !== "compaction");
+
+	const envelopeParts = [
+		// No session=/id= echo, same rationale as read_session: the caller
+		// passed the ref and can reuse it; the path stays in details.
+		header?.cwd ? `cwd=${header.cwd}` : undefined,
+		`entries=${sessionEntries.length}`,
+		`messages=${messages.length}`,
+		`span=${firstRaw?.id ?? "?"}..${target.firstKeptEntryId}`,
+	].filter((part): part is string => part !== undefined);
+
+	// Tail footnote envelope, same rationale as read_session.
+	const text = `${body}\n\n[${envelopeParts.join(" ")}]`;
+
+	return {
+		text,
+		details: {
+			path: filePath,
+			entryCount: sessionEntries.length,
+			messageCount: messages.length,
+			spanEntryCount: span.length,
+		},
+	};
+}
+
+// ============================================================================
+// Section 3: read_session_entry
+// ============================================================================
+
+/**
+ * Drill into the full content of a specific entry inside a pi session.
+ *
+ * `read_session` renders the transcript as compact stubs: tool results as
+ * one-line `## toolResult:<name> (id=xxxx, ~size)` stubs (errors keep a short
+ * preview), tool calls as `→ name(120-char args preview) [call_xxx] (id=xxxx)` lines, and `!`
+ * bash commands as `## bash (exit=N)` blocks with 300-char output
+ * previews. The full content behind those stubs — tool results (including
+ * `details`, where subagent results keep their full untruncated output),
+ * tool call arguments, bash output — is what the agent actually saw, and it
+ * is unreachable any other way: session JSONL lines are far too long for the
+ * native read tool. This tool takes a stub's `id=` and returns the complete
+ * content, untruncated, dispatched on the target entry's kind:
+ *
+ *   - toolResult message  → full text parts + non-text placeholders +
+ *                           `details` rendered as JSON.
+ *   - bashExecution message (`!` commands are persisted as plain message
+ *     entries by recordBashResult) → `$ command` + the full multiline
+ *     output, verbatim (no one-line collapsing, no preview cut).
+ *   - assistant message with toolCall parts → each call's name + full
+ *     pretty-printed arguments (the counterpart to the 120-char preview).
+ *
+ * Same discovery → drill pairing as `read_session_compaction`: the stub
+ * header formats are the contract between the tools.
+ *
+ * Strictly read-only (no `SessionManager.open()`); `session` accepts a path
+ * or id via `resolveSessionRef`; output is untruncated by design — re-reads
+ * of sessions collapse stubs via `formatTranscript`, so size does not
+ * compound.
+ */
+
+export const READ_ENTRY_DESCRIPTION =
+	"Read the full content of a specific entry inside a pi session — the content a read_session " +
+	"stub truncates. Pass a session (file path or session id, same rules as read_session) and an " +
+	"entry id — the id= on a ## toolResult:<name> (id=xxxx, ~size) stub line, on a → tool-call line " +
+	"(→ name(args) [call-xxxx] (id=xxxx)), or in the [truncated, full output: read_session_entry id=xxxx] marker of " +
+	"a ## bash (exit=N) block whose output was folded, in read_session " +
+	"output or read_session_compaction span output. Returns the complete content dispatched by " +
+	"entry kind: toolResult → text parts verbatim, non-text parts as placeholders, and the tool's " +
+	"details rendered as JSON when present (subagent results keep their full output in details); " +
+	"bashExecution (`!` command) → the command plus its full multiline output; assistant toolCall " +
+	"→ each call's full pretty-printed arguments. Untruncated. Read-only.";
+
+export const ReadEntryParams = Type.Object({
+	session: Type.String({
+		description:
+			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix).",
+	}),
+	entryId: Type.String({
+		description:
+			"Entry id to drill into. Ids are listed on ## toolResult:<name> (id=xxxx, ~size) stub lines, → tool-call lines (→ name(args) [call-xxxx] (id=xxxx)), and in the [truncated, full output: read_session_entry id=xxxx] marker of folded ## bash (exit=N) blocks in read_session output and read_session_compaction span output.",
+	}),
+});
+
+export interface ReadEntryDetails {
+	path: string;
+	entryCount: number;
+	/** Resolved entry kind — filled at execute time (renderCall only has the id). */
+	kind: "toolResult" | "bashExecution" | "toolCall";
+	/** kind=toolResult. */
+	tool?: string;
+	callId?: string;
+	isError?: boolean;
+	/** kind=bashExecution. */
+	command?: string;
+	exitCode?: number;
+	/** kind=toolCall. */
+	calls?: number;
+	/** kind=toolCall. Compact TUI preview lines: `name {json}` per call. */
+	preview?: string;
+}
+
+type ToolResultAgentMessage = Extract<AgentMessage, { role: "toolResult" }>;
+type BashExecutionAgentMessage = Extract<AgentMessage, { role: "bashExecution" }>;
+type AssistantAgentMessage = Extract<AgentMessage, { role: "assistant" }>;
+
+/**
+ * Render the full content of a tool result message: text parts verbatim,
+ * non-text parts as bracketed placeholders, then `details` as pretty-printed
+ * JSON when present (details carry e.g. a subagent's full untruncated output).
+ */
+function renderToolResultContent(msg: ToolResultAgentMessage): string {
+	const blocks: string[] = [];
+	for (const part of msg.content) {
+		if (part.type === "text") blocks.push(part.text);
+		else if (part.type === "image") blocks.push("[image part omitted]");
+		else blocks.push("[unknown part]");
+	}
+	if (msg.details !== undefined) {
+		let json: string;
+		try {
+			json = JSON.stringify(msg.details, null, 2);
+		} catch {
+			json = "(unserializable details)";
+		}
+		blocks.push(`## details\n${json}`);
+	}
+	return blocks.join("\n\n").trim();
+}
+
+/**
+ * Render the full content of a bashExecution message (`!` command): the
+ * command followed by its output verbatim — no whitespace collapsing, no
+ * preview cut (read_session's `## bash` block previews only 300 collapsed
+ * chars; this is the recovery path for the rest).
+ */
+function renderBashExecutionContent(msg: BashExecutionAgentMessage): string {
+	const blocks = [`$ ${msg.command}`];
+	if (msg.output) blocks.push(msg.output);
+	return blocks.join("\n\n").trim();
+}
+
+/**
+ * Render the full toolCall parts of an assistant message: each call's name
+ * plus its complete arguments pretty-printed (the counterpart to
+ * read_session's 120-char one-line preview).
+ */
+function renderAssistantToolCallsContent(msg: AssistantAgentMessage): string {
+	const blocks: string[] = [];
+	for (const part of msg.content) {
+		if (part.type !== "toolCall") continue;
+		let json: string;
+		try {
+			json = JSON.stringify(part.arguments, null, 2);
+		} catch {
+			json = "(unserializable arguments)";
+		}
+		blocks.push(`## toolCall ${part.name}${part.id ? ` [${part.id}]` : ""}\n${json}`);
+	}
+	return blocks.join("\n\n").trim();
+}
+
+/**
+ * Locate the target entry and render its full content verbatim (no envelope:
+ * the transcript stub already carries the identity metadata). Dispatches on
+ * the entry's kind; throws with a descriptive
+ * message for unresolvable session references, unknown ids, and entry kinds
+ * with nothing to drill into (user/custom messages are fully rendered by
+ * read_session; compaction entries belong to read_session_compaction).
+ */
+export async function readSessionEntry(
+	session: string,
+	entryId: string,
+): Promise<{ text: string; details: ReadEntryDetails }> {
+	const sessionPath = await resolveSessionRef(session);
+	const { filePath, entries: sessionEntries } = loadSessionEntries(sessionPath);
+
+	const target = sessionEntries.find((entry) => entry.id === entryId);
+	if (!target) {
+		throw new Error(
+			`read_session_entry: no entry with id "${entryId}" in ${filePath} (${sessionEntries.length} entries). ` +
+				"Entry ids are listed on ## toolResult:<name> (id=xxxx, ~size) stub lines, → tool-call lines (→ name(args) [call-xxxx] (id=xxxx)), " +
+				"and in the truncation marker of folded ## bash (exit=N) blocks in read_session output.",
+		);
+	}
+	if (target.type !== "message") {
+		const hint = target.type === "compaction" ? " Use read_session_compaction for compaction entries." : "";
+		throw new Error(
+			`read_session_entry: entry "${entryId}" is a ${target.type} entry, not a drillable message entry.${hint}`,
+		);
+	}
+	const msg = target.message;
+
+	let body: string;
+	let kind: ReadEntryDetails["kind"];
+	let kindDetails: Partial<ReadEntryDetails> = {};
+	if (msg.role === "toolResult") {
+		const toolMsg: ToolResultAgentMessage = msg;
+		body = renderToolResultContent(toolMsg) || "(empty tool result)";
+		kind = "toolResult";
+		kindDetails = { tool: toolMsg.toolName, callId: toolMsg.toolCallId, isError: toolMsg.isError };
+	} else if (msg.role === "bashExecution") {
+		const bashMsg: BashExecutionAgentMessage = msg;
+		body = renderBashExecutionContent(bashMsg) || "(no output)";
+		kind = "bashExecution";
+		kindDetails = { command: bashMsg.command, exitCode: bashMsg.exitCode };
+	} else if (msg.role === "assistant") {
+		const assistantMsg: AssistantAgentMessage = msg;
+		body = renderAssistantToolCallsContent(assistantMsg);
+		kind = "toolCall";
+		if (!body) {
+			throw new Error(
+				`read_session_entry: assistant entry "${entryId}" carries no tool calls (its text is already rendered in full by read_session).`,
+			);
+		}
+		const calls = assistantMsg.content.filter((part) => part.type === "toolCall").length;
+		kindDetails = {
+			calls,
+			preview: assistantMsg.content
+				.filter((part) => part.type === "toolCall")
+				.map((part) => `${part.name} ${JSON.stringify(part.arguments)}`)
+				.join("\n"),
+		};
+	} else {
+		throw new Error(
+			`read_session_entry: entry "${entryId}" is a ${msg.role} message; only toolResult, bashExecution, and assistant-with-toolCalls entries carry drillable content. ` +
+				"User and custom messages are already rendered in full by read_session.",
+		);
+	}
+
+	// No envelope: the caller just saw this entry's stub in the read_session
+	// transcript (tool name, call id, command, exit code are all on the stub
+	// line / block header), so echoing them back adds nothing. Identity
+	// metadata stays in details for TUI/debugging.
+	return { text: body, details: { path: filePath, entryCount: sessionEntries.length, kind, ...kindDetails } };
 }

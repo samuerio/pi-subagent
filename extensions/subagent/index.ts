@@ -32,18 +32,19 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import {
+	READ_ENTRY_DESCRIPTION,
+	READ_SESSION_COMPACTION_DESCRIPTION,
 	READ_SESSION_DESCRIPTION,
+	type ReadEntryDetails,
+	ReadEntryParams,
+	type ReadSessionCompactionDetails,
+	ReadSessionCompactionParams,
+	type ReadSessionDetails,
 	ReadSessionParams,
 	readSession,
-	type ReadSessionDetails,
-} from "./read-session.ts";
-import {
-	READ_SESSION_COMPACTION_DESCRIPTION,
-	ReadSessionCompactionParams,
 	readSessionCompaction,
-	type ReadSessionCompactionDetails,
-} from "./read-compaction.ts";
-import { READ_ENTRY_DESCRIPTION, ReadEntryParams, readSessionEntry, type ReadEntryDetails } from "./read-entry.ts";
+	readSessionEntry,
+} from "./read-session.ts";
 import { Text } from "@earendil-works/pi-tui";
 import {
 	FINDER_DESCRIPTION,
@@ -101,6 +102,62 @@ function loadInlineConfig(): { config: InlineConfig; error?: string } {
 	if (typeof raw.noSkills === "boolean") config.noSkills = raw.noSkills;
 
 	return { config };
+}
+
+/**
+ * Shared result renderer for the session viewers. ToolExecutionComponent
+ * stacks the call line and the result with no gap, so the renderer
+ * self-supplies the leading blank line (same trick as the built-in
+ * bash/read renderers). Collapsed: FIRST 5 visual lines at the current
+ * terminal width (long lines wrap first, so the preview never exceeds 5
+ * screen rows), plus the read renderer's "more lines" hint. Built as a
+ * width-aware component because ToolRenderResultOptions carries no width.
+ */
+function renderSessionResult(styled: string, expanded: boolean, theme: any) {
+	if (!expanded) {
+		const state: { width?: number; lines?: string[]; skipped?: number } = {};
+		const lead = [""];
+		return {
+			render: (width: number) => {
+				if (state.lines === undefined || state.width !== width) {
+					const all = new Text(styled, 0, 0).render(width);
+					state.lines = all.slice(0, 5);
+					state.skipped = Math.max(0, all.length - 5);
+					state.width = width;
+				}
+				const hint =
+					state.skipped && state.skipped > 0
+						? [
+								theme.fg("muted", `... (${state.skipped} more lines,`) +
+									` ${keyHint("app.tools.expand", "to expand")}` +
+									theme.fg("muted", ")"),
+							]
+						: [];
+				return [...lead, ...state.lines, ...hint];
+			},
+			invalidate: () => {
+				state.width = undefined;
+				state.lines = undefined;
+				state.skipped = undefined;
+			},
+		};
+	}
+	// Expanded: full content.
+	return new Text(`\n${styled}`, 0, 0);
+}
+
+/**
+ * Plain-text result renderer for `read_session` / `read_session_compaction`
+ * (no details to specialize on, transcript text as-is). Error results dye
+ * the whole message error-colored with no leading blank, matching
+ * read_session_entry's throw path.
+ */
+function renderTranscriptResult(result: any, opts: { expanded: boolean }, theme: any, context: any) {
+	const content = result.content
+		.map((part: any) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+		.join("");
+	if (context.isError) return new Text(theme.fg("error", content), 0, 0);
+	return renderSessionResult(content, opts.expanded, theme);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -165,9 +222,10 @@ export default function (pi: ExtensionAPI) {
 		renderResult: (result, opts, theme, context) => defaultTaskInstance.renderResult(result, opts, theme, context),
 	});
 
-	// --- read_session: read-only viewer for pi session JSONL files. No custom
-	// rendering; the harness's fallback renderer shows the returned transcript
-	// text as-is (docs/extensions.md: undefined slots use fallback rendering).
+	// --- read_session: read-only viewer for pi session JSONL files. Custom
+	// renderResult only self-supplies the call/result separator blank line
+	// (ToolExecutionComponent stacks them with no gap); collapsed preview
+	// and expansion come from the shared renderSessionResult helper.
 	pi.registerTool({
 		name: "read_session",
 		label: "Read Session",
@@ -178,11 +236,12 @@ export default function (pi: ExtensionAPI) {
 			const { text, details } = await readSession(params.session, params.leafId);
 			return { content: [{ type: "text", text }], details };
 		},
+		renderResult: renderTranscriptResult,
 	});
 
 	// --- read_session_compaction: drill into the original content a compaction
-	// entry replaced. Same no-custom-rendering pattern as read_session: the
-	// harness's fallback renderer shows the returned text as-is.
+	// entry replaced. Same plain-text rendering pattern as read_session
+	// (renderTranscriptResult: separator blank line + collapsed preview).
 	pi.registerTool({
 		name: "read_session_compaction",
 		label: "Read Session Compaction",
@@ -193,12 +252,13 @@ export default function (pi: ExtensionAPI) {
 			const { text, details } = await readSessionCompaction(params.session, params.entryId);
 			return { content: [{ type: "text", text }], details };
 		},
+		renderResult: renderTranscriptResult,
 	});
 
 	// --- read_session_entry: drill into the full content of a specific entry
 	// (tool result / tool call arguments / bash output — the id= on the
-	// matching stub in read_session output). Same no-custom-rendering
-	// pattern as the other session viewers.
+	// matching stub in read_session output). Rendering follows the other
+	// session viewers (renderSessionResult: separator blank line + preview).
 	pi.registerTool({
 		name: "read_session_entry",
 		label: "Read Session Entry",
@@ -240,52 +300,15 @@ export default function (pi: ExtensionAPI) {
 			// No headers anywhere: every kind's content self-identifies (bash
 			// `$ command`, toolCall `## toolCall <name>`) or is bare text the
 			// caller just saw as a stub (toolResult; callId/(error) add
-			// nothing the transcript stub didn't already show). Blank line +
-			// per-line toolOutput styling, matching the built-in renderers
-			// (bash/read): ToolExecutionComponent stacks call line and result
-			// with no gap, and the built-ins self-supply the separator. The
+			// nothing the transcript stub didn't already show). Per-line
+			// toolOutput styling; the leading blank line + collapsed preview
+			// come from the shared renderSessionResult helper. The
 			// `## details` marker line is dimmed: payload separator, not body.
 			const styled = tuiContent
 				.split("\n")
 				.map((line) => (line === "## details" ? theme.fg("dim", line) : theme.fg("toolOutput", line)))
 				.join("\n");
-			// Collapsed: FIRST 5 visual lines at the current terminal width
-			// (long lines wrap first, so the preview never exceeds 5 screen
-			// rows), plus the read renderer's "more lines" hint. Head, not
-			// bash's tail: for drill results the beginning (command line,
-			// error head) is what identifies the content. Built as a
-			// width-aware component because ToolRenderResultOptions carries
-			// no width.
-			if (!expanded) {
-				const state: { width?: number; lines?: string[]; skipped?: number } = {};
-				const lead = [""];
-				return {
-					render: (width) => {
-						if (state.lines === undefined || state.width !== width) {
-							const all = new Text(styled, 0, 0).render(width);
-							state.lines = all.slice(0, 5);
-							state.skipped = Math.max(0, all.length - 5);
-							state.width = width;
-						}
-						const hint =
-							state.skipped && state.skipped > 0
-								? [
-										theme.fg("muted", `... (${state.skipped} more lines,`) +
-											` ${keyHint("app.tools.expand", "to expand")}` +
-											theme.fg("muted", ")"),
-									]
-								: [];
-						return [...lead, ...state.lines, ...hint];
-					},
-					invalidate: () => {
-						state.width = undefined;
-						state.lines = undefined;
-						state.skipped = undefined;
-					},
-				};
-			}
-			// Expanded: full content.
-			return new Text(`\n${styled}`, 0, 0);
+			return renderSessionResult(styled, expanded, theme);
 		},
 	});
 }
