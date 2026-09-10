@@ -44,7 +44,6 @@ import {
 	type ReadSessionCompactionDetails,
 } from "./read-compaction.ts";
 import { READ_ENTRY_DESCRIPTION, ReadEntryParams, readSessionEntry, type ReadEntryDetails } from "./read-entry.ts";
-import { shortToolCallId } from "./read-session.ts";
 import { Text } from "@earendil-works/pi-tui";
 import {
 	FINDER_DESCRIPTION,
@@ -235,33 +234,20 @@ export default function (pi: ExtensionAPI) {
 			if (!d?.kind) {
 				return new Text(context.isError ? theme.fg("error", content) : content, 0, 0);
 			}
-			let summary: string;
-			// bashExecution content already starts with `$ command`; the
-			// header would only repeat it (exit code lives in the caller's
-			// read_session transcript anyway). No header for this kind.
-			if (d.kind === "toolResult") {
-				const callId = d.callId ? shortToolCallId(d.callId) : "";
-				summary = `toolResult ${d.tool ?? ""}${callId ? ` [${callId}]` : ""}${d.isError ? " (error)" : ""}`;
-			} else if (d.kind === "bashExecution") {
-				summary = "";
-			} else {
-				// toolCall: content's first line (`## toolCall <name> …`) already
-				// identifies it; render compact `name {args}` instead of the
-				// pretty-printed block.
-				summary = "";
-			}
 			// toolCall gets the compact one-line-per-call preview from details;
 			// other kinds render the body as-is.
 			const tuiContent = d.kind === "toolCall" ? (d.preview ?? content) : content;
-			const header = summary ? theme.fg(d.isError ? "error" : "muted", `─── ${summary} ───`) : "";
-			// Blank line + per-line toolOutput styling, matching the built-in
-			// renderers (bash/read): ToolExecutionComponent stacks call line
-			// and result with no gap, and the built-ins self-supply the
-			// separator. Error results keep toolOutput content; the header
-			// above already carries the error color.
+			// No headers anywhere: every kind's content self-identifies (bash
+			// `$ command`, toolCall `## toolCall <name>`) or is bare text the
+			// caller just saw as a stub (toolResult; callId/(error) add
+			// nothing the transcript stub didn't already show). Blank line +
+			// per-line toolOutput styling, matching the built-in renderers
+			// (bash/read): ToolExecutionComponent stacks call line and result
+			// with no gap, and the built-ins self-supply the separator. The
+			// `## details` marker line is dimmed: payload separator, not body.
 			const styled = tuiContent
 				.split("\n")
-				.map((line) => theme.fg("toolOutput", line))
+				.map((line) => (line === "## details" ? theme.fg("dim", line) : theme.fg("toolOutput", line)))
 				.join("\n");
 			// Collapsed: FIRST 5 visual lines at the current terminal width
 			// (long lines wrap first, so the preview never exceeds 5 screen
@@ -272,7 +258,7 @@ export default function (pi: ExtensionAPI) {
 			// no width.
 			if (!expanded) {
 				const state: { width?: number; lines?: string[]; skipped?: number } = {};
-				const lead = header ? ["", header] : [""];
+				const lead = [""];
 				return {
 					render: (width) => {
 						if (state.lines === undefined || state.width !== width) {
@@ -299,7 +285,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			// Expanded: full content.
-			return new Text(`\n${header}${header ? "\n" : ""}${styled}`, 0, 0);
+			return new Text(`\n${styled}`, 0, 0);
 		},
 	});
 }
