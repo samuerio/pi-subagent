@@ -26,8 +26,6 @@ import { getAgentDir, getMarkdownTheme, withFileMutationQueue } from "@earendil-
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-/** Byte cap on the verbatim child output embedded in the model-facing envelope. */
-const OUTPUT_CAP = 50 * 1024;
 const COLLAPSED_ITEM_COUNT = 10;
 
 export interface SubagentSpec {
@@ -238,20 +236,9 @@ function buildEnvelope(result: SingleResult): string {
 	return `[${parts.join(" ")}]`;
 }
 
-/** Envelope header + the child's verbatim (byte-capped) output. */
+/** Envelope header + the child's verbatim output. */
 function buildTaskBlock(result: SingleResult): string {
-	return `${buildEnvelope(result)}\n${truncateOutput(getResultOutput(result))}`;
-}
-
-function truncateOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+	return `${buildEnvelope(result)}\n${getResultOutput(result)}`;
 }
 /** Identity color fn: strips theme colors for plain-text contexts (error throw). */
 const plainFg = (_color: any, text: string): string => text;
@@ -524,7 +511,7 @@ export class Subagent {
 		}
 	}
 
-	/** Build the model-facing envelope + verbatim (byte-capped) child output. */
+	/** Build the model-facing envelope + verbatim child output. */
 	buildTaskBlock(result: SingleResult): string {
 		return buildTaskBlock(result);
 	}

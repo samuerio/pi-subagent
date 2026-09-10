@@ -35,7 +35,7 @@ export const READ_SESSION_COMPACTION_DESCRIPTION =
 	"Reconstruct the content a specific compaction's summary was derived from: the previous " +
 	"compaction summary plus the raw messages that compaction summarized. Pass a pi session (file " +
 	"path or session id, same rules as read_session) and a compaction entry id (from a compactionSummary " +
-	"block header in read_session output). Returns an envelope line (session id, counts, " +
+	"block header in read_session output). Returns an envelope line (counts, " +
 	"span=<firstRawId>..<firstKeptEntryId>) then the previous summary as a compactionSummary " +
 	"block, then the raw messages summarized. For the first compaction there is no previous " +
 	"summary, so only the raw is returned. Output is not truncated. Read-only.";
@@ -43,7 +43,7 @@ export const READ_SESSION_COMPACTION_DESCRIPTION =
 export const ReadSessionCompactionParams = Type.Object({
 	session: Type.String({
 		description:
-			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix, from the id= field of read_session's envelope).",
+			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix).",
 	}),
 	entryId: Type.String({
 		description:
@@ -121,8 +121,8 @@ export async function readSessionCompaction(
 	const firstRaw = span.find((entry) => entry.type !== "compaction");
 
 	const envelopeParts = [
-		`session=${filePath}`,
-		header?.id ? `id=${header.id}` : undefined,
+		// No session=/id= echo, same rationale as read_session: the caller
+		// passed the ref and can reuse it; the path stays in details.
 		header?.cwd ? `cwd=${header.cwd}` : undefined,
 		`entries=${sessionEntries.length}`,
 		`messages=${messages.length}`,

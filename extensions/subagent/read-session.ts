@@ -75,22 +75,27 @@ export const READ_SESSION_DESCRIPTION =
 	"covers sessions under ~/.pi/agent/sessions/<project>/; sessions outside that layout (e.g. " +
 	"subagent sessions) are only reachable by path, which a subagent envelope reports as session=. " +
 	"Returns an envelope line " +
-	"(session id, cwd, entry/message counts, thinking level, model) followed by the active-branch " +
+	"(cwd, entry/message counts, thinking level, model) followed by the active-branch " +
 	"transcript with compaction applied: user/assistant text, tool calls, error results, and " +
-	"compaction/branch summaries. compactionSummary block headers carry the compaction entry id " +
+	"compaction/branch summaries. entries= counts context entries while messages= counts rendered " +
+	"messages; state-change entries (model_change, thinking_level_change) project to no messages, " +
+	"so entries may exceed messages. compactionSummary block headers carry the compaction entry id " +
 	"(id=xxxx tokensBefore=N) and branchSummary headers carry fromId=; pass a compaction id to " +
 	"read_session_compaction to read the original content that compaction replaced. Tool calls and results carry a " +
 	"shared truncated toolCallId key ([call-xxxx]) so parallel calls match to their results. Entry ids are the drill " +
-	"handles for read_session_entry: toolResult stubs (## toolResult:<name> (id=xxxx)) → full result content, " +
-	"toolCall lines (→ [call-xxxx] (id=xxxx) name(args)) → full call arguments, bash blocks (## bash (exit=N, id=xxxx)) → full " +
-	"command output. Read-only. " +
+	"handles for read_session_entry: toolResult stubs (## toolResult:<name> (id=xxxx, ~size)) → full result content, " +
+	"toolCall lines (→ name(args) [call-xxxx] (id=xxxx)) → full call arguments, bash blocks (## bash (exit=N)) → the " +
+	"command and its output, folded to a one-line preview with a trailing " +
+	"[truncated, full output: read_session_entry id=xxxx] marker when over 300 chars (the id lives only in that " +
+	"marker — short outputs are fully rendered and need no drill), and successful toolResult stubs carry a " +
+	"~size (result text length) telling whether the full result is worth drilling. Read-only. " +
 	"Pass leafId to inspect a specific branch tip; omit it for the current leaf (the file's last " +
 	"entry).";
 
 export const ReadSessionParams = Type.Object({
 	session: Type.String({
 		description:
-			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix, from the id= field of read_session's envelope).",
+			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix).",
 	}),
 	leafId: Type.Optional(
 		Type.String({
@@ -153,9 +158,9 @@ export async function resolveSessionRef(ref: string): Promise<string> {
 	if (globalMatch) return globalMatch.path;
 
 	throw new Error(
-		`no session found for "${ref}". Session ids come from the id= field of read_session's envelope. ` +
-			"Id lookup only covers sessions under ~/.pi/agent/sessions/<project>/; for sessions outside that layout " +
-			"(e.g. subagent sessions), pass the .jsonl path instead.",
+		`no session found for "${ref}". Id lookup resolves pi session ids (exact match first, then prefix, most ` +
+			"recently modified wins) and only covers sessions under ~/.pi/agent/sessions/<project>/; for sessions " +
+			"outside that layout (e.g. subagent sessions), pass the .jsonl path instead.",
 	);
 }
 
@@ -172,6 +177,16 @@ export function textOf(content: string | Array<{ type: string; text?: string }>)
 function preview(text: string, max: number): string {
 	const line = text.replace(/\s+/g, " ").trim();
 	return line.length > max ? `${line.slice(0, max)}...` : line;
+}
+
+/**
+ * Approximate human-readable size of recoverable content, for stub headers.
+ * Counted in UTF-16 chars (not bytes), hence the `~` prefix at call sites.
+ */
+function formatSize(chars: number): string {
+	if (chars < 1024) return `${chars}B`;
+	if (chars < 1024 * 1024) return `${(chars / 1024).toFixed(1)}KB`;
+	return `${(chars / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 function formatToolCallArgs(args: Record<string, unknown>): string {
@@ -216,8 +231,9 @@ export function formatTranscript(
 			case "assistant": {
 				// Entries carrying toolCall parts are annotated with id= (the
 				// drill handle for the calls' full arguments via
-				// read_session_entry); the id is stamped on each `→` line,
-				// right after the [call_xxx] key (before the long args blob).
+				// read_session_entry). Line rule: content first (tool name +
+				// args blob), metadata last ([call_xxx] match key + (id=...)),
+				// mirroring the trailing handles on stub and bash blocks.
 				const note = annotations.get(index);
 				const idTag = note ? `(${note})` : "";
 				const lines: string[] = [];
@@ -227,8 +243,9 @@ export function formatTranscript(
 						if (text) lines.push(text);
 					} else if (part.type === "toolCall") {
 						const cid = shortToolCallId(part.id);
-						const head = ["→", cid ? `[${cid}]` : undefined, idTag, part.name].filter(Boolean).join(" ");
-						lines.push(`${head}(${formatToolCallArgs(part.arguments)})`);
+						const tail = [cid ? `[${cid}]` : undefined, idTag].filter(Boolean).join(" ");
+						const body = `${part.name}(${formatToolCallArgs(part.arguments)})`;
+						lines.push(tail ? `→ ${body} ${tail}` : `→ ${body}`);
 					}
 					// thinking parts are skipped
 				}
@@ -239,7 +256,9 @@ export function formatTranscript(
 				// Every result renders a one-line stub: [call-key] links it back
 				// to the assistant tool call (so parallel calls match their
 				// results); id= is the session-entry drill handle for
-				// read_session_entry. Errors keep a short preview inline.
+				// read_session_entry. The trailing ~size is the result text
+				// length (chars), telling the reader which stubs are worth
+				// drilling and which are not. Errors keep a short preview
 				// No annotation (zip dropped) → no stub, as before.
 				const note = annotations.get(index);
 				const callKey = shortToolCallId(msg.toolCallId);
@@ -250,7 +269,9 @@ export function formatTranscript(
 						`## toolResult:${msg.toolName} ${cid}(error${note ? `, ${note}` : ""})${text ? `\n${preview(text, TOOL_RESULT_ERROR_PREVIEW)}` : ""}`,
 					);
 				} else if (note) {
-					blocks.push(`## toolResult:${msg.toolName} ${cid}(${note})`);
+					blocks.push(
+						`## toolResult:${msg.toolName} ${cid}(${note}, ~${formatSize(textOf(msg.content).length)})`,
+					);
 				}
 				break;
 			}
@@ -260,11 +281,20 @@ export function formatTranscript(
 				break;
 			}
 			case "bashExecution": {
-				// id= is the drill handle for the full output via read_session_entry.
+				// Unlike stubs and toolCall lines (which render no content and
+				// need a permanent id), bash blocks render the output itself:
+				// the drill handle is only needed when the output is folded,
+				// so the id lives in the truncation marker, not the header.
+				// The marker is EXPLICIT for a reason: a bare `...` ending has
+				// been misread as a truncated transcript.
 				const note = annotations.get(index);
-				const output = msg.output ? preview(msg.output, BASH_OUTPUT_PREVIEW) : "";
+				const full = msg.output ? msg.output.replace(/\s+/g, " ").trim() : "";
+				const output =
+					full.length > BASH_OUTPUT_PREVIEW
+						? `${full.slice(0, BASH_OUTPUT_PREVIEW)}${note ? ` ⋯ [truncated, full output: read_session_entry ${note}]` : " ⋯ [truncated]"}`
+						: full;
 				blocks.push(
-					`## bash (exit=${msg.exitCode ?? "?"}${note ? `, ${note}` : ""})\n$ ${msg.command}${output ? `\n${output}` : ""}`,
+					`## bash (exit=${msg.exitCode ?? "?"})\n$ ${msg.command}${output ? `\n${output}` : ""}`,
 				);
 				break;
 			}
@@ -402,8 +432,9 @@ export async function readSession(
 	const contextEntries = buildContextEntries(sessionEntries, leafId);
 	const annotations = alignAnnotations(contextEntries, context.messages);
 	const envelopeParts = [
-		`session=${filePath}`,
-		header?.id ? `id=${header.id}` : undefined,
+		// No session=/id= echo: the caller passed the path or the id and
+		// can reuse it for every drill tool (they accept both forms). The
+		// resolved path stays in details for TUI/debugging.
 		header?.cwd ? `cwd=${header.cwd}` : undefined,
 		`entries=${contextEntries.length}`,
 		`messages=${context.messages.length}`,

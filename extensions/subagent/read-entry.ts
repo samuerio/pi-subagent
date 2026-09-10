@@ -3,9 +3,9 @@
  * inside a pi session.
  *
  * `read_session` renders the transcript as compact stubs: tool results as
- * one-line `## toolResult:<name> (id=xxxx)` stubs (errors keep a short
- * preview), tool calls as `→ [call_xxx] (id=xxxx) name(120-char args preview)` lines, and `!`
- * bash commands as `## bash (exit=N, id=xxxx)` blocks with 300-char output
+ * one-line `## toolResult:<name> (id=xxxx, ~size)` stubs (errors keep a short
+ * preview), tool calls as `→ name(120-char args preview) [call_xxx] (id=xxxx)` lines, and `!`
+ * bash commands as `## bash (exit=N)` blocks with 300-char output
  * previews. The full content behind those stubs — tool results (including
  * `details`, where subagent results keep their full untruncated output),
  * tool call arguments, bash output — is what the agent actually saw, and it
@@ -40,8 +40,9 @@ import { loadSessionEntries, resolveSessionRef } from "./read-session.ts";
 export const READ_ENTRY_DESCRIPTION =
 	"Read the full content of a specific entry inside a pi session — the content a read_session " +
 	"stub truncates. Pass a session (file path or session id, same rules as read_session) and an " +
-	"entry id — the id= on a ## toolResult:<name> (id=xxxx) stub line, on a → tool-call line " +
-	"(→ [call-xxxx] (id=xxxx) name(args)), or on a ## bash (exit=N, id=xxxx) block header in read_session " +
+	"entry id — the id= on a ## toolResult:<name> (id=xxxx, ~size) stub line, on a → tool-call line " +
+	"(→ name(args) [call-xxxx] (id=xxxx)), or in the [truncated, full output: read_session_entry id=xxxx] marker of " +
+	"a ## bash (exit=N) block whose output was folded, in read_session " +
 	"output or read_session_compaction span output. Returns the complete content dispatched by " +
 	"entry kind: toolResult → text parts verbatim, non-text parts as placeholders, and the tool's " +
 	"details rendered as JSON when present (subagent results keep their full output in details); " +
@@ -51,11 +52,11 @@ export const READ_ENTRY_DESCRIPTION =
 export const ReadEntryParams = Type.Object({
 	session: Type.String({
 		description:
-			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix, from the id= field of read_session's envelope).",
+			"Session file path (contains / or \\, or ends .jsonl; ~ expands to the home directory) or a session id (uuid or unambiguous prefix).",
 	}),
 	entryId: Type.String({
 		description:
-			"Entry id to drill into. Ids are listed on ## toolResult:<name> (id=xxxx) stub lines, → tool-call lines (→ [call-xxxx] (id=xxxx) name(args)), and ## bash (exit=N, id=xxxx) block headers in read_session output and read_session_compaction span output.",
+			"Entry id to drill into. Ids are listed on ## toolResult:<name> (id=xxxx, ~size) stub lines, → tool-call lines (→ name(args) [call-xxxx] (id=xxxx)), and in the [truncated, full output: read_session_entry id=xxxx] marker of folded ## bash (exit=N) blocks in read_session output and read_session_compaction span output.",
 	}),
 });
 
@@ -153,8 +154,8 @@ export async function readSessionEntry(
 	if (!target) {
 		throw new Error(
 			`read_session_entry: no entry with id "${entryId}" in ${filePath} (${sessionEntries.length} entries). ` +
-				"Entry ids are listed on ## toolResult:<name> (id=xxxx) stub lines, → tool-call lines (→ [call-xxxx] (id=xxxx) name(args)), " +
-				"and ## bash (exit=N, id=xxxx) block headers in read_session output.",
+				"Entry ids are listed on ## toolResult:<name> (id=xxxx, ~size) stub lines, → tool-call lines (→ name(args) [call-xxxx] (id=xxxx)), " +
+				"and in the truncation marker of folded ## bash (exit=N) blocks in read_session output.",
 		);
 	}
 	if (target.type !== "message") {
@@ -205,11 +206,11 @@ export async function readSessionEntry(
 	}
 
 	const text = `[${[
-		`session=${filePath}`,
-		header?.id ? `id=${header.id}` : undefined,
 		header?.cwd ? `cwd=${header.cwd}` : undefined,
 		...envelopeParts,
 		`entries=${sessionEntries.length}`,
 	].filter((part): part is string => part !== undefined)}]\n${body}`;
+	// No session=/id= echo, same rationale as read_session: the caller passed
+	// the ref and can reuse it for further drills; the path stays in details.
 	return { text, details: { path: filePath, entryCount: sessionEntries.length, kind, ...kindDetails } };
 }

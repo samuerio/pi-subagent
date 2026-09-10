@@ -79,7 +79,7 @@ Two streams, deliberately separated:
 
 - **To the human:** live streaming of tool calls and progress (observability). This does
   **not** enter the main agent's context.
-- **To the main agent:** only the final output, byte-capped, prefixed with a terse
+- **To the main agent:** only the final output, verbatim, prefixed with a terse
   `[key=value …]` envelope (status, model, `session=<path>`, cost) so it can
   correlate quality↔model and read the full trace if it wants to verify or debug.
   See [Result envelope](#result-envelope).
@@ -129,7 +129,7 @@ prefixed with one terse machine-parsable line carrying only what the *tool* uniq
 
 ```
 [agent=task status=done model=github-copilot/gpt-5.3-codex thinking=low turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
-<the child's own final output, verbatim, byte-capped>
+<the child's own final output, verbatim>
 ```
 
 `status` is one of `done` / `failed` / `aborted`. The tool does
@@ -221,8 +221,8 @@ Named agents are not affected by this file — they carry their own
 
 - **Collapsed view:** status, last few items, usage stats (turns, tokens, cost, context).
 - **Expanded view (Ctrl+O):** full task, tool calls, final output as Markdown, per-task usage.
-- Model-visible output is capped at **50 KB**; the full result stays in tool
-  `details` and in the child's session file.
+- Model-visible output is the child's final message, verbatim (uncapped); the
+  full result also stays in tool `details` and in the child's session file.
 - **Abort:** Ctrl+C / `/interrupt` kills the child process but **flushes partial results** — the in-flight child returns partial output and keeps its session path (see **Abort & partial results**).
 
 ---
