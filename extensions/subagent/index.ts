@@ -30,7 +30,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import {
 	READ_SESSION_DESCRIPTION,
 	ReadSessionParams,
@@ -236,23 +236,70 @@ export default function (pi: ExtensionAPI) {
 				return new Text(context.isError ? theme.fg("error", content) : content, 0, 0);
 			}
 			let summary: string;
+			// bashExecution content already starts with `$ command`; the
+			// header would only repeat it (exit code lives in the caller's
+			// read_session transcript anyway). No header for this kind.
 			if (d.kind === "toolResult") {
 				const callId = d.callId ? shortToolCallId(d.callId) : "";
 				summary = `toolResult ${d.tool ?? ""}${callId ? ` [${callId}]` : ""}${d.isError ? " (error)" : ""}`;
 			} else if (d.kind === "bashExecution") {
-				summary = `bash (exit=${d.exitCode ?? "?"}) $ ${d.command ?? ""}`;
+				summary = "";
 			} else {
-				summary = `${d.calls ?? "?"} tool call${d.calls === 1 ? "" : "s"}`;
+				// toolCall: content's first line (`## toolCall <name> …`) already
+				// identifies it; render compact `name {args}` instead of the
+				// pretty-printed block.
+				summary = "";
 			}
-			const header = theme.fg(d.isError ? "error" : "muted", `─── ${summary} ───`);
-			// Collapsed: header + a few content lines. Expanded: full content.
+			// toolCall gets the compact one-line-per-call preview from details;
+			// other kinds render the body as-is.
+			const tuiContent = d.kind === "toolCall" ? (d.preview ?? content) : content;
+			const header = summary ? theme.fg(d.isError ? "error" : "muted", `─── ${summary} ───`) : "";
+			// Blank line + per-line toolOutput styling, matching the built-in
+			// renderers (bash/read): ToolExecutionComponent stacks call line
+			// and result with no gap, and the built-ins self-supply the
+			// separator. Error results keep toolOutput content; the header
+			// above already carries the error color.
+			const styled = tuiContent
+				.split("\n")
+				.map((line) => theme.fg("toolOutput", line))
+				.join("\n");
+			// Collapsed: FIRST 5 visual lines at the current terminal width
+			// (long lines wrap first, so the preview never exceeds 5 screen
+			// rows), plus the read renderer's "more lines" hint. Head, not
+			// bash's tail: for drill results the beginning (command line,
+			// error head) is what identifies the content. Built as a
+			// width-aware component because ToolRenderResultOptions carries
+			// no width.
 			if (!expanded) {
-				const lines = content.split("\n");
-				const shown = lines.slice(0, 8).join("\n");
-				const text = `${header}\n${shown}${lines.length > 8 ? `\n${theme.fg("dim", `… ${lines.length - 8} more lines (expand to view)`)}` : ""}`;
-				return new Text(text, 0, 0);
+				const state: { width?: number; lines?: string[]; skipped?: number } = {};
+				const lead = header ? ["", header] : [""];
+				return {
+					render: (width) => {
+						if (state.lines === undefined || state.width !== width) {
+							const all = new Text(styled, 0, 0).render(width);
+							state.lines = all.slice(0, 5);
+							state.skipped = Math.max(0, all.length - 5);
+							state.width = width;
+						}
+						const hint =
+							state.skipped && state.skipped > 0
+								? [
+										theme.fg("muted", `... (${state.skipped} more lines,`) +
+											` ${keyHint("app.tools.expand", "to expand")}` +
+											theme.fg("muted", ")"),
+									]
+								: [];
+						return [...lead, ...state.lines, ...hint];
+					},
+					invalidate: () => {
+						state.width = undefined;
+						state.lines = undefined;
+						state.skipped = undefined;
+					},
+				};
 			}
-			return new Text(`${header}\n${content}`, 0, 0);
+			// Expanded: full content.
+			return new Text(`\n${header}${header ? "\n" : ""}${styled}`, 0, 0);
 		},
 	});
 }

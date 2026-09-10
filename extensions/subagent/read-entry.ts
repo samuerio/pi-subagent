@@ -74,6 +74,8 @@ export interface ReadEntryDetails {
 	exitCode?: number;
 	/** kind=toolCall. */
 	calls?: number;
+	/** kind=toolCall. Compact TUI preview lines: `name {json}` per call. */
+	preview?: string;
 }
 
 type ToolResultAgentMessage = Extract<AgentMessage, { role: "toolResult" }>;
@@ -137,8 +139,9 @@ function renderAssistantToolCallsContent(msg: AssistantAgentMessage): string {
 }
 
 /**
- * Locate the target entry and render its full content, wrapped in an
- * envelope. Dispatches on the entry's kind; throws with a descriptive
+ * Locate the target entry and render its full content verbatim (no envelope:
+ * the transcript stub already carries the identity metadata). Dispatches on
+ * the entry's kind; throws with a descriptive
  * message for unresolvable session references, unknown ids, and entry kinds
  * with nothing to drill into (user/custom messages are fully rendered by
  * read_session; compaction entries belong to read_session_compaction).
@@ -148,7 +151,7 @@ export async function readSessionEntry(
 	entryId: string,
 ): Promise<{ text: string; details: ReadEntryDetails }> {
 	const sessionPath = await resolveSessionRef(session);
-	const { filePath, header, entries: sessionEntries } = loadSessionEntries(sessionPath);
+	const { filePath, entries: sessionEntries } = loadSessionEntries(sessionPath);
 
 	const target = sessionEntries.find((entry) => entry.id === entryId);
 	if (!target) {
@@ -167,7 +170,6 @@ export async function readSessionEntry(
 	const msg = target.message;
 
 	let body: string;
-	let envelopeParts: (string | undefined)[];
 	let kind: ReadEntryDetails["kind"];
 	let kindDetails: Partial<ReadEntryDetails> = {};
 	if (msg.role === "toolResult") {
@@ -175,17 +177,11 @@ export async function readSessionEntry(
 		body = renderToolResultContent(toolMsg) || "(empty tool result)";
 		kind = "toolResult";
 		kindDetails = { tool: toolMsg.toolName, callId: toolMsg.toolCallId, isError: toolMsg.isError };
-		envelopeParts = [
-			`tool=${toolMsg.toolName}`,
-			`callId=${toolMsg.toolCallId}`,
-			`isError=${toolMsg.isError}`,
-		];
 	} else if (msg.role === "bashExecution") {
 		const bashMsg: BashExecutionAgentMessage = msg;
 		body = renderBashExecutionContent(bashMsg) || "(no output)";
 		kind = "bashExecution";
 		kindDetails = { command: bashMsg.command, exitCode: bashMsg.exitCode };
-		envelopeParts = [`command=${bashMsg.command}`, `exit=${bashMsg.exitCode ?? "?"}`];
 	} else if (msg.role === "assistant") {
 		const assistantMsg: AssistantAgentMessage = msg;
 		body = renderAssistantToolCallsContent(assistantMsg);
@@ -196,8 +192,13 @@ export async function readSessionEntry(
 			);
 		}
 		const calls = assistantMsg.content.filter((part) => part.type === "toolCall").length;
-		kindDetails = { calls };
-		envelopeParts = [`calls=${calls}`];
+		kindDetails = {
+			calls,
+			preview: assistantMsg.content
+				.filter((part) => part.type === "toolCall")
+				.map((part) => `${part.name} ${JSON.stringify(part.arguments)}`)
+				.join("\n"),
+		};
 	} else {
 		throw new Error(
 			`read_session_entry: entry "${entryId}" is a ${msg.role} message; only toolResult, bashExecution, and assistant-with-toolCalls entries carry drillable content. ` +
@@ -205,12 +206,9 @@ export async function readSessionEntry(
 		);
 	}
 
-	const text = `[${[
-		header?.cwd ? `cwd=${header.cwd}` : undefined,
-		...envelopeParts,
-		`entries=${sessionEntries.length}`,
-	].filter((part): part is string => part !== undefined)}]\n${body}`;
-	// No session=/id= echo, same rationale as read_session: the caller passed
-	// the ref and can reuse it for further drills; the path stays in details.
-	return { text, details: { path: filePath, entryCount: sessionEntries.length, kind, ...kindDetails } };
+	// No envelope: the caller just saw this entry's stub in the read_session
+	// transcript (tool name, call id, command, exit code are all on the stub
+	// line / block header), so echoing them back adds nothing. Identity
+	// metadata stays in details for TUI/debugging.
+	return { text: body, details: { path: filePath, entryCount: sessionEntries.length, kind, ...kindDetails } };
 }
