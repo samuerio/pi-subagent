@@ -127,9 +127,15 @@ function formatToolCall(
 	args: Record<string, unknown>,
 	themeFg: (color: any, text: string) => string,
 ): string {
+	// Same convention as index.ts's shortenPath: cwd-relative when the path
+	// lives under the process cwd, otherwise $HOME collapsed to `~`.
 	const shortenPath = (p: string) => {
+		const resolved = path.resolve(p);
+		if (resolved === process.cwd() || resolved.startsWith(process.cwd() + path.sep)) {
+			return path.relative(process.cwd(), resolved);
+		}
 		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+		return resolved.startsWith(home) ? `~${resolved.slice(home.length)}` : resolved;
 	};
 
 	switch (toolName) {

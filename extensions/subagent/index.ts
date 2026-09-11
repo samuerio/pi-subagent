@@ -154,12 +154,19 @@ function renderSessionResult(styled: string, expanded: boolean, theme: any) {
 }
 
 /**
- * Display-only path shortening: collapse the $HOME prefix to `~`. Purely
- * cosmetic (expandHome reverses it); used in renderCall text.
+ * Display-only path shortening, matching the built-in read renderer's
+ * convention (see the show_markdown preview work): cwd-relative when the
+ * path lives under the process cwd, otherwise the $HOME prefix collapsed
+ * to `~`. Purely cosmetic (expandHome reverses both forms); used in
+ * renderCall text.
  */
 function shortenPath(p: string): string {
+	const resolved = path.resolve(p);
+	if (resolved === process.cwd() || resolved.startsWith(process.cwd() + path.sep)) {
+		return path.relative(process.cwd(), resolved);
+	}
 	const home = homedir();
-	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+	return resolved.startsWith(home) ? `~${resolved.slice(home.length)}` : resolved;
 }
 
 /**
